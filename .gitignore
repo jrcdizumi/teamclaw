@@ -74,8 +74,10 @@ playwright-report/
 # Tauri MCP plugin (cloned dependency)
 .tauri-plugin-mcp/
 
-# Knowledge
+# Knowledge (runtime data directories, not source code)
 knowledge/
+!src/components/knowledge/
+!packages/app/src/components/knowledge/
 
 # Session context (per-workspace, do not commit)
 .claude/session-context/current.md
