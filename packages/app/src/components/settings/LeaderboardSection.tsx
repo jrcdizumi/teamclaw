@@ -226,13 +226,6 @@ export function LeaderboardSection() {
         <p className="text-sm text-destructive">{error}</p>
       )}
 
-      {/* Auto-sync info banner */}
-      <div className="rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/30 px-4 py-2.5">
-        <p className="text-xs text-blue-700 dark:text-blue-300">
-          💡 Stats are from <strong>.teamclaw/stats.json</strong> in each workspace. Each member's ranking shows aggregated data from <strong>all their workspaces</strong>. Automatically synced as you work. Click <strong>Refresh</strong> to update immediately.
-        </p>
-      </div>
-
       {memberStats.length === 0 && !loading && (
         <p className="text-sm text-muted-foreground">
           No leaderboard data yet. Your stats will be automatically synced when you complete sessions or provide feedback.

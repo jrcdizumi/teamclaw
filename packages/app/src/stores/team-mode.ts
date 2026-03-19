@@ -115,8 +115,10 @@ export const useTeamModeStore = create<TeamModeState>((set, get) => ({
       await addCustomProviderToConfig(workspacePath, {
         name: 'Team',
         baseURL: teamModelConfig.baseUrl,
-        modelId: teamModelConfig.model,
-        modelName: teamModelConfig.modelName,
+        models: [{
+          modelId: teamModelConfig.model,
+          modelName: teamModelConfig.modelName,
+        }],
       })
 
       // Determine API key: user override or NodeId
@@ -214,6 +216,23 @@ export const useTeamModeStore = create<TeamModeState>((set, get) => ({
       
       // Force disconnect the team provider to remove it from the list immediately
       await providerStore.disconnectProvider(TEAM_PROVIDER_ID)
+      
+      // Wait for OpenCode to be fully ready before initializing
+      if (isTauri()) {
+        const { getOpenCodeClient } = await import('@/lib/opencode/client')
+        let retries = 10
+        while (retries > 0) {
+          try {
+            const client = getOpenCodeClient()
+            const isReady = await client.isReady()
+            if (isReady) break
+          } catch {
+            // Client not ready yet
+          }
+          await new Promise((r) => setTimeout(r, 300))
+          retries--
+        }
+      }
       
       // Ensure UI updates by refreshing providers and initializing
       await providerStore.initAll()

@@ -3,12 +3,21 @@
  * Used to add/remove custom OpenAI-compatible providers.
  */
 
+// Model configuration for custom provider
+export interface CustomModelConfig {
+  modelId: string
+  modelName?: string
+  limit?: {
+    context?: number
+    output?: number
+  }
+}
+
 // Shape of a custom provider entry in opencode.json
 export interface CustomProviderConfig {
   name: string
   baseURL: string
-  modelId: string
-  modelName?: string
+  models: CustomModelConfig[]
 }
 
 // Provider entry as stored in opencode.json
@@ -16,7 +25,7 @@ interface OpenCodeProviderEntry {
   npm: string
   name?: string
   options?: { baseURL?: string; [key: string]: unknown }
-  models?: Record<string, { name: string }>
+  models?: Record<string, { name: string; limit?: { context?: number; output?: number } }>
 }
 
 export type SkillPermission = 'allow' | 'deny' | 'ask'
@@ -91,21 +100,117 @@ export async function addCustomProviderToConfig(
     openCodeConfig.provider = {}
   }
 
+  // Build models object from the models array
+  const modelsObj: Record<string, { name: string; limit?: { context?: number; output?: number } }> = {}
+  for (const model of config.models) {
+    const modelEntry: { name: string; limit?: { context?: number; output?: number } } = {
+      name: model.modelName || model.modelId,
+    }
+    
+    // Add limit if any values are specified
+    if (model.limit && (model.limit.context !== undefined || model.limit.output !== undefined)) {
+      modelEntry.limit = {}
+      if (model.limit.context !== undefined) {
+        modelEntry.limit.context = model.limit.context
+      }
+      if (model.limit.output !== undefined) {
+        modelEntry.limit.output = model.limit.output
+      }
+    }
+    
+    modelsObj[model.modelId] = modelEntry
+  }
+
   openCodeConfig.provider[providerId] = {
     npm: '@ai-sdk/openai-compatible',
     name: config.name,
     options: {
       baseURL: config.baseURL,
     },
-    models: {
-      [config.modelId]: {
-        name: config.modelName || config.modelId,
-      },
-    },
+    models: modelsObj,
   }
 
   await writeOpenCodeConfig(workspacePath, openCodeConfig)
   return providerId
+}
+
+/**
+ * Get a custom provider configuration from opencode.json.
+ */
+export async function getCustomProviderConfig(
+  workspacePath: string,
+  providerId: string
+): Promise<CustomProviderConfig | null> {
+  const openCodeConfig = await readOpenCodeConfig(workspacePath)
+  
+  const providerEntry = openCodeConfig.provider?.[providerId]
+  if (!providerEntry) return null
+  
+  const models: CustomModelConfig[] = []
+  if (providerEntry.models) {
+    for (const [modelId, modelData] of Object.entries(providerEntry.models)) {
+      models.push({
+        modelId,
+        modelName: modelData.name,
+        limit: modelData.limit,
+      })
+    }
+  }
+  
+  return {
+    name: providerEntry.name || providerId,
+    baseURL: providerEntry.options?.baseURL || '',
+    models,
+  }
+}
+
+/**
+ * Update an existing custom provider in opencode.json.
+ * Returns true if successful.
+ */
+export async function updateCustomProviderConfig(
+  workspacePath: string,
+  providerId: string,
+  config: CustomProviderConfig
+): Promise<boolean> {
+  const openCodeConfig = await readOpenCodeConfig(workspacePath)
+
+  if (!openCodeConfig.provider?.[providerId]) {
+    return false
+  }
+
+  // Build models object from the models array
+  const modelsObj: Record<string, { name: string; limit?: { context?: number; output?: number } }> = {}
+  for (const model of config.models) {
+    const modelEntry: { name: string; limit?: { context?: number; output?: number } } = {
+      name: model.modelName || model.modelId,
+    }
+    
+    // Add limit if any values are specified
+    if (model.limit && (model.limit.context !== undefined || model.limit.output !== undefined)) {
+      modelEntry.limit = {}
+      if (model.limit.context !== undefined) {
+        modelEntry.limit.context = model.limit.context
+      }
+      if (model.limit.output !== undefined) {
+        modelEntry.limit.output = model.limit.output
+      }
+    }
+    
+    modelsObj[model.modelId] = modelEntry
+  }
+
+  openCodeConfig.provider[providerId] = {
+    npm: '@ai-sdk/openai-compatible',
+    name: config.name,
+    options: {
+      baseURL: config.baseURL,
+    },
+    models: modelsObj,
+  }
+
+  await writeOpenCodeConfig(workspacePath, openCodeConfig)
+  return true
 }
 
 /**

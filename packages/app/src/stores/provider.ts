@@ -4,6 +4,8 @@ import { toast } from 'sonner'
 import {
   type CustomProviderConfig,
   addCustomProviderToConfig,
+  updateCustomProviderConfig,
+  getCustomProviderConfig,
   removeCustomProviderFromConfig,
   getCustomProviderIds,
 } from '@/lib/opencode/config'
@@ -69,6 +71,8 @@ export interface ProviderState {
   connectProvider: (providerId: string, apiKey: string) => Promise<boolean>
   disconnectProvider: (providerId: string) => Promise<boolean>
   addCustomProvider: (workspacePath: string, config: CustomProviderConfig, apiKey: string) => Promise<string | null>
+  updateCustomProvider: (workspacePath: string, providerId: string, config: CustomProviderConfig) => Promise<boolean>
+  getCustomProvider: (workspacePath: string, providerId: string) => Promise<CustomProviderConfig | null>
   removeCustomProvider: (workspacePath: string, providerId: string) => Promise<boolean>
   selectModel: (providerId: string, modelId: string, modelName: string) => Promise<void>
   initAll: () => Promise<void>
@@ -109,9 +113,13 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
       set({ providers, providersLoading: false })
     } catch (err) {
       console.error('Failed to load providers:', err)
-      toast.error('Failed to load providers', {
-        description: err instanceof Error ? err.message : 'Unknown error',
-      })
+      // Only show toast if it's not a connection error (OpenCode not ready)
+      const isConnectionError = err instanceof Error && err.message.includes('Cannot connect to OpenCode')
+      if (!isConnectionError) {
+        toast.error('Failed to load providers', {
+          description: err instanceof Error ? err.message : 'Unknown error',
+        })
+      }
       set({ providersLoading: false })
     }
   },
@@ -156,9 +164,13 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
       })
     } catch (err) {
       console.error('Failed to load configured providers:', err)
-      toast.error('Failed to load model list', {
-        description: err instanceof Error ? err.message : 'Unknown error',
-      })
+      // Only show toast if it's not a connection error (OpenCode not ready)
+      const isConnectionError = err instanceof Error && err.message.includes('Cannot connect to OpenCode')
+      if (!isConnectionError) {
+        toast.error('Failed to load model list', {
+          description: err instanceof Error ? err.message : 'Unknown error',
+        })
+      }
       set({ configuredProvidersLoading: false })
     }
   },
@@ -321,6 +333,35 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
       toast.error('Failed to add custom provider', {
         description: err instanceof Error ? err.message : 'Unknown error',
       })
+      return null
+    }
+  },
+
+  // Update an existing custom provider
+  updateCustomProvider: async (workspacePath: string, providerId: string, config: CustomProviderConfig) => {
+    try {
+      const success = await updateCustomProviderConfig(workspacePath, providerId, config)
+      if (success) {
+        toast.success('Custom provider updated', {
+          description: `${config.name} has been updated. Restarting OpenCode...`,
+        })
+      }
+      return success
+    } catch (err) {
+      console.error('Failed to update custom provider:', err)
+      toast.error('Failed to update custom provider', {
+        description: err instanceof Error ? err.message : 'Unknown error',
+      })
+      return false
+    }
+  },
+
+  // Get a custom provider configuration
+  getCustomProvider: async (workspacePath: string, providerId: string) => {
+    try {
+      return await getCustomProviderConfig(workspacePath, providerId)
+    } catch (err) {
+      console.error('Failed to get custom provider:', err)
       return null
     }
   },
