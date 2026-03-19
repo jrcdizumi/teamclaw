@@ -578,7 +578,7 @@ fn ensure_inherent_config(workspace_path: &str) -> Result<(), String> {
                 serde_json::json!({
                     "type": "local",
                     "enabled": true,
-                    "command": ["pnpm", "dlx", "@playwright/mcp@latest"]
+                    "command": ["npx", "-y", "@playwright/mcp@latest"]
                 }),
             );
             changed = true;
@@ -591,7 +591,7 @@ fn ensure_inherent_config(workspace_path: &str) -> Result<(), String> {
                 serde_json::json!({
                     "type": "local",
                     "enabled": true,
-                    "command": ["pnpm", "dlx", "autoui-mcp@latest"],
+                    "command": ["npx", "-y", "autoui-mcp@latest"],
                     "environment": {
                         "QWEN_API_KEY": "${QWEN_API_KEY}",
                         "QWEN_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
