@@ -111,7 +111,7 @@ async fn handle_file_event(
     // Get the affected path
     let paths = &event.event.paths;
     if paths.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let path = &paths[0];
