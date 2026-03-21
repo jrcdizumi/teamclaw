@@ -7,6 +7,9 @@ on:
     types: [opened]
   release:
     types: [published]
+  watch:
+    types: [started]
+  fork:
 
 jobs:
   notify:
@@ -35,6 +38,32 @@ jobs:
               "msgtype": "markdown",
               "markdown": {
                 "content": "## 🐛 新的 Issue\n> **标题**: '"$(echo '${{ github.event.issue.title }}' | sed 's/"/\\"/g')"'\n> **作者**: ${{ github.event.issue.user.login }}\n> **链接**: [查看 Issue](${{ github.event.issue.html_url }})"
+              }
+            }'
+
+      - name: Notify on Star
+        if: github.event_name == 'watch'
+        run: |
+          curl -s -X POST \
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECOM_WEBHOOK_KEY }}" \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "msgtype": "markdown",
+              "markdown": {
+                "content": "## ⭐ 新的 Star\n> **用户**: [${{ github.actor }}](https://github.com/${{ github.actor }})\n> **仓库**: [${{ github.repository }}](https://github.com/${{ github.repository }})"
+              }
+            }'
+
+      - name: Notify on Fork
+        if: github.event_name == 'fork'
+        run: |
+          curl -s -X POST \
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECOM_WEBHOOK_KEY }}" \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "msgtype": "markdown",
+              "markdown": {
+                "content": "## 🍴 仓库被 Fork\n> **用户**: [${{ github.actor }}](https://github.com/${{ github.actor }})\n> **Fork 仓库**: [${{ github.event.forkee.full_name }}](https://github.com/${{ github.event.forkee.full_name }})"
               }
             }'
 
