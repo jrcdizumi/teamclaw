@@ -409,7 +409,7 @@ export function ChatInputArea({
                 Plan
               </Button>
 
-              {(!teamMode || devUnlocked) && selectedModelOption?.provider !== 'team' && (
+              {(!teamMode || devUnlocked) && (
                 <ModelSelector
                   open={modelSelectorOpen}
                   onOpenChange={setModelSelectorOpen}
