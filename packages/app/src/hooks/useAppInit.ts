@@ -180,6 +180,7 @@ export function useGitReposInit() {
   const workspacePath = useWorkspaceStore((s) => s.workspacePath);
   const { initialize: initGitRepos, syncAll: syncGitRepos } = useGitReposStore();
   const hasGitSynced = useRef(false);
+  const teamSyncIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     if (workspacePath && !hasGitSynced.current) {
@@ -195,7 +196,7 @@ export function useGitReposInit() {
           console.warn("[App] Git repos init failed (non-critical):", err);
         });
 
-      // Auto-sync team workspace repo on startup and load team shortcuts
+      // Auto-sync team workspace repo on startup + every 5 minutes, and load team shortcuts
       if (isTauri()) {
         import("@tauri-apps/api/core")
           .then(({ invoke }) => {
@@ -203,14 +204,25 @@ export function useGitReposInit() {
               .then((config: unknown) => {
                 const teamConfig = config as { enabled?: boolean } | null;
                 if (teamConfig?.enabled) {
+                  const doSync = () => {
+                    invoke("team_sync_repo")
+                      .then(() => {
+                        console.log("[App] Team repo sync completed (MCP configs updated)");
+                      })
+                      .catch((err: unknown) => {
+                        console.warn("[App] Team repo sync failed (non-critical):", err);
+                      });
+                  };
+
                   console.log("[App] Team config found, syncing team repo...");
-                  invoke("team_sync_repo")
-                    .then(() => {
-                      console.log("[App] Team repo sync completed (MCP configs updated)");
-                    })
-                    .catch((err: unknown) => {
-                      console.warn("[App] Team repo sync failed (non-critical):", err);
-                    });
+                  doSync();
+
+                  // Periodic sync every 5 minutes
+                  const intervalId = setInterval(() => {
+                    console.log("[App] Periodic team repo sync...");
+                    doSync();
+                  }, 5 * 60 * 1000);
+                  teamSyncIntervalRef.current = intervalId;
                 }
               })
               .catch((err: unknown) => {
@@ -234,6 +246,13 @@ export function useGitReposInit() {
           });
       }
     }
+
+    return () => {
+      if (teamSyncIntervalRef.current) {
+        clearInterval(teamSyncIntervalRef.current);
+        teamSyncIntervalRef.current = null;
+      }
+    };
   }, [workspacePath, initGitRepos, syncGitRepos]);
 }
 
