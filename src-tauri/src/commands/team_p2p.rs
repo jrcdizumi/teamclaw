@@ -1779,12 +1779,25 @@ pub async fn p2p_reconnect(
         .parse::<iroh_docs::NamespaceId>()
         .map_err(|e| format!("Invalid namespace ID: {}", e))?;
 
-    let doc = node
-        .docs
-        .open(namespace_id)
-        .await
-        .map_err(|e| format!("Failed to open doc: {}", e))?
-        .ok_or("Team document not found in local storage")?;
+    let doc = match node.docs.open(namespace_id).await {
+        Ok(Some(doc)) => doc,
+        _ => {
+            // Doc not in local storage — try re-importing from saved ticket
+            if let Some(ref ticket_str) = config.doc_ticket {
+                eprintln!("[P2P] Doc not found locally, re-importing from saved ticket");
+                let ticket = ticket_str
+                    .trim()
+                    .parse::<iroh_docs::DocTicket>()
+                    .map_err(|_| "Invalid saved ticket".to_string())?;
+                node.docs
+                    .import(ticket)
+                    .await
+                    .map_err(|e| format!("Failed to re-import doc: {}", e))?
+            } else {
+                return Err("Team document not found and no ticket to re-import".to_string());
+            }
+        }
+    };
 
     // Start background sync
     let team_dir = format!("{}/teamclaw-team", workspace_path);
