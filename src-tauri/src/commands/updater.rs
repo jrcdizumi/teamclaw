@@ -1,9 +1,4 @@
-use std::collections::HashMap;
 use base64::{engine::general_purpose::STANDARD, Engine};
-#[cfg(target_os = "macos")]
-use std::io::Cursor;
-#[cfg(target_os = "macos")]
-use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
@@ -11,6 +6,11 @@ use minisign_verify::{PublicKey, Signature};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::io::Cursor;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Runtime};
 
 const REPO_OWNER: &str = "diffrent-ai-studio";
