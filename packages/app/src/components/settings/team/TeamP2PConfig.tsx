@@ -153,7 +153,7 @@ export function TeamP2PConfig() {
   const [createInviteCode, setCreateInviteCode] = React.useState('')
   const [createOwnerName, setCreateOwnerName] = React.useState('')
   const [createOwnerEmail, setCreateOwnerEmail] = React.useState('')
-  const [_showShareBox, setShowShareBox] = React.useState(false)
+  const [, setShowShareBox] = React.useState(false)
   const [dissolveLoading, setDissolveLoading] = React.useState(false)
   const [confirmDissolve, setConfirmDissolve] = React.useState(false)
 
