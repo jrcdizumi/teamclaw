@@ -527,7 +527,19 @@ pub async fn rotate_namespace(
     }
 
     // Re-create as owner
-    create_team(node, team_dir, workspace_path, None, None, None, None, None, None, None).await
+    create_team(
+        node,
+        team_dir,
+        workspace_path,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 // ─── Background Sync Tasks ──────────────────────────────────────────────
@@ -552,7 +564,16 @@ fn start_sync_tasks(
     // Task A: remote doc changes → disk
     let my_node_id_a = my_node_id.clone();
     tokio::spawn(async move {
-        doc_to_disk_watcher(doc_a, blobs_store, team_dir_a, suppressed_a, my_node_id_a, owner_node_id, app_handle).await;
+        doc_to_disk_watcher(
+            doc_a,
+            blobs_store,
+            team_dir_a,
+            suppressed_a,
+            my_node_id_a,
+            owner_node_id,
+            app_handle,
+        )
+        .await;
     });
 
     // Task B: local disk changes → doc (with blob store for skills counting)
@@ -697,7 +718,8 @@ async fn doc_to_disk_watcher(
                 if key.starts_with("_team/left/") {
                     let leaving_node_id = key.trim_start_matches("_team/left/").to_string();
                     // Verify the writer IS the departing member (not someone forging a leave)
-                    let writer_is_member = writer_node_id.as_deref() == Some(leaving_node_id.as_str());
+                    let writer_is_member =
+                        writer_node_id.as_deref() == Some(leaving_node_id.as_str());
                     // Only auto-remove if WE are the owner
                     let we_are_owner = owner_node_id.as_deref() == Some(my_node_id.as_str());
 
@@ -718,7 +740,9 @@ async fn doc_to_disk_watcher(
                                     .find(|mem| mem.node_id == leaving_node_id)
                                     .map(|mem| mem.name)
                             })
-                            .unwrap_or_else(|| leaving_node_id[..8.min(leaving_node_id.len())].to_string());
+                            .unwrap_or_else(|| {
+                                leaving_node_id[..8.min(leaving_node_id.len())].to_string()
+                            });
 
                         match remove_member_from_team(
                             &workspace_path,
@@ -727,15 +751,16 @@ async fn doc_to_disk_watcher(
                             &leaving_node_id,
                         ) {
                             Ok(()) => {
-                                eprintln!("[P2P] Auto-removed departed member: {}", leaving_node_id);
+                                eprintln!(
+                                    "[P2P] Auto-removed departed member: {}",
+                                    leaving_node_id
+                                );
                                 // Refresh role cache
                                 if let Ok(Some(manifest)) = read_members_manifest(&team_dir) {
                                     node_to_role.clear();
                                     for member in &manifest.members {
-                                        node_to_role.insert(
-                                            member.node_id.clone(),
-                                            member.role.clone(),
-                                        );
+                                        node_to_role
+                                            .insert(member.node_id.clone(), member.role.clone());
                                     }
                                 }
                                 // Emit Tauri event so the owner's UI can show a notification
@@ -1670,7 +1695,19 @@ pub async fn p2p_publish_drive(
 
     // If no active doc, create a team (first-time publish)
     if node.active_doc.is_none() {
-        return create_team(node, &team_dir, &workspace_path, None, None, None, None, None, None, None).await;
+        return create_team(
+            node,
+            &team_dir,
+            &workspace_path,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
     }
 
     // Otherwise, sync current files into existing doc and return saved ticket
@@ -1876,7 +1913,11 @@ pub async fn p2p_save_seed_config(
         config.seed_url = if url.is_empty() { None } else { Some(url) };
     }
     if let Some(secret) = team_secret {
-        config.team_secret = if secret.is_empty() { None } else { Some(secret) };
+        config.team_secret = if secret.is_empty() {
+            None
+        } else {
+            Some(secret)
+        };
     }
     write_p2p_config(&workspace_path, Some(&config))?;
     Ok(())
@@ -2060,7 +2101,12 @@ mod tests {
             &mut node,
             team_dir.to_str().unwrap(),
             tmp.path().to_str().unwrap(),
-            None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -2490,7 +2536,12 @@ mod tests {
             &mut node,
             team_dir.to_str().unwrap(),
             workspace,
-            None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
