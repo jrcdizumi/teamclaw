@@ -222,6 +222,10 @@ pub async fn create_team(
     llm_base_url: Option<String>,
     llm_model: Option<String>,
     llm_model_name: Option<String>,
+    team_name: Option<String>,
+    owner_name: Option<String>,
+    owner_email: Option<String>,
+    app_handle: Option<tauri::AppHandle>,
 ) -> Result<String, String> {
     scaffold_team_dir(team_dir)?;
 
@@ -234,9 +238,25 @@ pub async fn create_team(
     let node_id = get_node_id(node);
     let info = get_device_metadata();
 
+    // Write _team/team.json with team metadata
+    let team_info = serde_json::json!({
+        "teamName": team_name.as_deref().unwrap_or(""),
+        "ownerName": owner_name.as_deref().unwrap_or(""),
+        "ownerEmail": owner_email.as_deref().unwrap_or(""),
+        "ownerNodeId": &node_id,
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+    });
+    let team_info_dir = Path::new(team_dir).join("_team");
+    std::fs::create_dir_all(&team_info_dir).ok();
+    std::fs::write(
+        team_info_dir.join("team.json"),
+        serde_json::to_string_pretty(&team_info).unwrap_or_default(),
+    )
+    .map_err(|e| format!("Failed to write team.json: {}", e))?;
+
     let owner_member = TeamMember {
         node_id: node_id.clone(),
-        name: String::new(),
+        name: owner_name.unwrap_or_default(),
         role: MemberRole::Owner,
         label: info.hostname.clone(),
         platform: info.platform,
@@ -292,6 +312,7 @@ pub async fn create_team(
         Arc::new(Mutex::new(MemberRole::Owner)),
         node_id_for_sync,
         Some(node_id.clone()),
+        app_handle,
     );
 
     node.active_doc = Some(doc);
@@ -319,6 +340,7 @@ pub async fn join_team_drive(
     ticket_str: &str,
     team_dir: &str,
     workspace_path: &str,
+    app_handle: Option<tauri::AppHandle>,
 ) -> Result<String, String> {
     use std::str::FromStr;
 
@@ -389,6 +411,7 @@ pub async fn join_team_drive(
         Arc::new(Mutex::new(joiner_role.clone())),
         node_id_for_sync,
         manifest_owner.clone(),
+        app_handle,
     );
 
     node.active_doc = Some(doc);
@@ -504,7 +527,19 @@ pub async fn rotate_namespace(
     }
 
     // Re-create as owner
-    create_team(node, team_dir, workspace_path, None, None, None).await
+    create_team(
+        node,
+        team_dir,
+        workspace_path,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 // ─── Background Sync Tasks ──────────────────────────────────────────────
@@ -516,9 +551,10 @@ fn start_sync_tasks(
     store: &FsStore,
     team_dir: &str,
     suppressed_paths: Arc<Mutex<HashSet<std::path::PathBuf>>>,
-    my_role: Arc<Mutex<MemberRole>>, // NEW
-    my_node_id: String,              // NEW
-    owner_node_id: Option<String>,   // NEW
+    my_role: Arc<Mutex<MemberRole>>,
+    my_node_id: String,
+    owner_node_id: Option<String>,
+    app_handle: Option<tauri::AppHandle>,
 ) {
     let blobs_store: iroh_blobs::api::Store = store.clone().into();
     let team_dir_a = team_dir.to_string();
@@ -526,8 +562,18 @@ fn start_sync_tasks(
     let suppressed_a = suppressed_paths.clone();
 
     // Task A: remote doc changes → disk
+    let my_node_id_a = my_node_id.clone();
     tokio::spawn(async move {
-        doc_to_disk_watcher(doc_a, blobs_store, team_dir_a, suppressed_a, owner_node_id).await;
+        doc_to_disk_watcher(
+            doc_a,
+            blobs_store,
+            team_dir_a,
+            suppressed_a,
+            my_node_id_a,
+            owner_node_id,
+            app_handle,
+        )
+        .await;
     });
 
     // Task B: local disk changes → doc (with blob store for skills counting)
@@ -583,7 +629,9 @@ async fn doc_to_disk_watcher(
     blobs_store: iroh_blobs::api::Store,
     team_dir: String,
     suppressed_paths: Arc<Mutex<HashSet<std::path::PathBuf>>>,
+    my_node_id: String,
     owner_node_id: Option<String>,
+    app_handle: Option<tauri::AppHandle>,
 ) {
     use futures_lite::StreamExt;
     use iroh_docs::engine::LiveEvent;
@@ -665,6 +713,84 @@ async fn doc_to_disk_watcher(
 
                 // Resolve author → node_id
                 let writer_node_id = author_to_node.get(&author_id_str).cloned();
+
+                // Handle _team/left/<node_id>: member voluntarily left the team
+                if key.starts_with("_team/left/") {
+                    let leaving_node_id = key.trim_start_matches("_team/left/").to_string();
+                    // Verify the writer IS the departing member (not someone forging a leave)
+                    let writer_is_member =
+                        writer_node_id.as_deref() == Some(leaving_node_id.as_str());
+                    // Only auto-remove if WE are the owner
+                    let we_are_owner = owner_node_id.as_deref() == Some(my_node_id.as_str());
+
+                    if writer_is_member && we_are_owner {
+                        // workspace_path = team_dir without trailing /teamclaw-team
+                        let workspace_path = team_dir
+                            .strip_suffix("/teamclaw-team")
+                            .unwrap_or(&team_dir)
+                            .to_string();
+                        // Look up member name before removing (for notification)
+                        let leaving_name = node_to_role
+                            .keys()
+                            .find(|k| *k == &leaving_node_id)
+                            .and_then(|_| read_members_manifest(&team_dir).ok().flatten())
+                            .and_then(|m| {
+                                m.members
+                                    .into_iter()
+                                    .find(|mem| mem.node_id == leaving_node_id)
+                                    .map(|mem| mem.name)
+                            })
+                            .unwrap_or_else(|| {
+                                leaving_node_id[..8.min(leaving_node_id.len())].to_string()
+                            });
+
+                        match remove_member_from_team(
+                            &workspace_path,
+                            &team_dir,
+                            &my_node_id,
+                            &leaving_node_id,
+                        ) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "[P2P] Auto-removed departed member: {}",
+                                    leaving_node_id
+                                );
+                                // Refresh role cache
+                                if let Ok(Some(manifest)) = read_members_manifest(&team_dir) {
+                                    node_to_role.clear();
+                                    for member in &manifest.members {
+                                        node_to_role
+                                            .insert(member.node_id.clone(), member.role.clone());
+                                    }
+                                }
+                                // Emit Tauri event so the owner's UI can show a notification
+                                if let Some(ref app) = app_handle {
+                                    use tauri::Emitter;
+                                    let _ = app.emit(
+                                        "team:member-left",
+                                        serde_json::json!({
+                                            "nodeId": leaving_node_id,
+                                            "name": leaving_name,
+                                        }),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[P2P] Failed to auto-remove departed member {}: {}",
+                                    leaving_node_id, e
+                                );
+                            }
+                        }
+                    }
+
+                    // Write tombstone file to disk regardless
+                    if let Ok(content) = blobs_store.blobs().get_bytes(entry.content_hash()).await {
+                        let file_path = Path::new(&team_dir).join(&key);
+                        write_and_suppress(&file_path, &content, &suppressed_paths).await;
+                    }
+                    continue;
+                }
 
                 // Validate _team/members.json writes: only accept from owner
                 if key == "_team/members.json" {
@@ -954,6 +1080,11 @@ pub struct P2pConfig {
     /// Role in the team: owner, editor, or viewer
     #[serde(default)]
     pub role: Option<MemberRole>,
+    /// Seed node URL for team discovery and applications
+    #[serde(default)]
+    pub seed_url: Option<String>,
+    #[serde(default)]
+    pub team_secret: Option<String>,
 }
 
 /// Read P2P config from teamclaw.json in the workspace.
@@ -1060,6 +1191,66 @@ pub fn read_members_manifest(team_dir: &str) -> Result<Option<TeamManifest>, Str
     Ok(Some(manifest))
 }
 
+// ─── Leave Team (member) ─────────────────────────────────────────────────
+
+/// Leave the team as a non-owner member.
+/// Writes a leave tombstone to the P2P doc so the owner is notified,
+/// then disconnects and removes all local team data.
+#[tauri::command]
+pub async fn p2p_leave_team(
+    iroh_state: tauri::State<'_, IrohState>,
+    opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
+) -> Result<(), String> {
+    let workspace_path = opencode_state
+        .workspace_path
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or("No workspace path set")?;
+
+    // Owner must use p2p_dissolve_team instead
+    let config = read_p2p_config(&workspace_path)?.unwrap_or_default();
+    if config.role == Some(MemberRole::Owner) {
+        return Err("Team owners cannot leave — use Dissolve Team to end the team".to_string());
+    }
+
+    // Write leave tombstone so the owner's sync detects the departure
+    let mut guard = iroh_state.lock().await;
+    if let Some(node) = guard.as_mut() {
+        let my_node_id = get_node_id(node);
+        if let Some(doc) = &node.active_doc {
+            let leave_key = format!("_team/left/{}", my_node_id);
+            let _ = doc
+                .set_bytes(
+                    node.author,
+                    leave_key,
+                    chrono::Utc::now().to_rfc3339().into_bytes(),
+                )
+                .await;
+            // Brief pause to let tombstone propagate
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
+        if let Some(doc) = node.active_doc.take() {
+            let _ = doc.leave().await;
+        }
+    }
+    drop(guard);
+
+    // Remove local team data
+    let teamclaw_dir = format!("{}/{}", workspace_path, crate::commands::TEAMCLAW_DIR);
+    if Path::new(&teamclaw_dir).exists() {
+        std::fs::remove_dir_all(&teamclaw_dir)
+            .map_err(|e| format!("Failed to remove .teamclaw directory: {}", e))?;
+    }
+    let team_dir = format!("{}/teamclaw-team", workspace_path);
+    if Path::new(&team_dir).exists() {
+        std::fs::remove_dir_all(&team_dir)
+            .map_err(|e| format!("Failed to remove team directory: {}", e))?;
+    }
+
+    Ok(())
+}
+
 // ─── Disconnect ─────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1107,6 +1298,61 @@ pub async fn p2p_disconnect_source(
     }
 
     // Remove teamclaw-team directory
+    let team_dir = format!("{}/teamclaw-team", workspace_path);
+    if Path::new(&team_dir).exists() {
+        std::fs::remove_dir_all(&team_dir)
+            .map_err(|e| format!("Failed to remove team directory: {}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Dissolve the team. Only the owner can call this.
+/// Writes a tombstone to notify other members, then cleans up local data.
+#[tauri::command]
+pub async fn p2p_dissolve_team(
+    iroh_state: tauri::State<'_, IrohState>,
+    opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
+) -> Result<(), String> {
+    let workspace_path = opencode_state
+        .workspace_path
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or("No workspace path set")?;
+
+    // Only owner can dissolve
+    let config = read_p2p_config(&workspace_path)?.unwrap_or_default();
+    if config.role != Some(MemberRole::Owner) {
+        return Err("Only the team owner can dissolve the team".to_string());
+    }
+
+    // Write tombstone to doc so other members know team is dissolved
+    let mut guard = iroh_state.lock().await;
+    if let Some(node) = guard.as_mut() {
+        if let Some(doc) = &node.active_doc {
+            let _ = doc
+                .set_bytes(
+                    node.author,
+                    "_team/dissolved",
+                    chrono::Utc::now().to_rfc3339().into_bytes(),
+                )
+                .await;
+            // Brief pause to let tombstone propagate
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        if let Some(doc) = node.active_doc.take() {
+            let _ = doc.leave().await;
+        }
+    }
+    drop(guard);
+
+    // Clean up local data
+    let teamclaw_dir = format!("{}/{}", workspace_path, crate::commands::TEAMCLAW_DIR);
+    if Path::new(&teamclaw_dir).exists() {
+        std::fs::remove_dir_all(&teamclaw_dir)
+            .map_err(|e| format!("Failed to remove .teamclaw directory: {}", e))?;
+    }
     let team_dir = format!("{}/teamclaw-team", workspace_path);
     if Path::new(&team_dir).exists() {
         std::fs::remove_dir_all(&team_dir)
@@ -1394,9 +1640,13 @@ pub async fn p2p_check_team_dir(
 
 #[tauri::command]
 pub async fn p2p_create_team(
+    app: tauri::AppHandle,
     llm_base_url: Option<String>,
     llm_model: Option<String>,
     llm_model_name: Option<String>,
+    team_name: Option<String>,
+    owner_name: Option<String>,
+    owner_email: Option<String>,
     iroh_state: tauri::State<'_, IrohState>,
     opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
 ) -> Result<String, String> {
@@ -1418,6 +1668,10 @@ pub async fn p2p_create_team(
         llm_base_url,
         llm_model,
         llm_model_name,
+        team_name,
+        owner_name,
+        owner_email,
+        Some(app),
     )
     .await
 }
@@ -1441,7 +1695,19 @@ pub async fn p2p_publish_drive(
 
     // If no active doc, create a team (first-time publish)
     if node.active_doc.is_none() {
-        return create_team(node, &team_dir, &workspace_path, None, None, None).await;
+        return create_team(
+            node,
+            &team_dir,
+            &workspace_path,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
     }
 
     // Otherwise, sync current files into existing doc and return saved ticket
@@ -1455,6 +1721,7 @@ pub async fn p2p_publish_drive(
 
 #[tauri::command]
 pub async fn p2p_join_drive(
+    app: tauri::AppHandle,
     ticket: String,
     #[allow(unused_variables)] label: String,
     iroh_state: tauri::State<'_, IrohState>,
@@ -1471,12 +1738,13 @@ pub async fn p2p_join_drive(
     let node = guard.as_mut().ok_or("P2P node not running")?;
 
     let team_dir = format!("{}/teamclaw-team", workspace_path);
-    join_team_drive(node, &ticket, &team_dir, &workspace_path).await
+    join_team_drive(node, &ticket, &team_dir, &workspace_path, Some(app)).await
 }
 
 /// Reconnect to an existing team document on app restart.
 #[tauri::command]
 pub async fn p2p_reconnect(
+    app: tauri::AppHandle,
     iroh_state: tauri::State<'_, IrohState>,
     opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
 ) -> Result<(), String> {
@@ -1528,6 +1796,7 @@ pub async fn p2p_reconnect(
         Arc::new(Mutex::new(my_role)),
         my_node_id,
         config.owner_node_id.clone(),
+        Some(app),
     );
 
     node.active_doc = Some(doc);
@@ -1607,6 +1876,8 @@ pub async fn p2p_sync_status(
         last_sync_at: config.last_sync_at,
         members: config.allowed_members,
         owner_node_id: config.owner_node_id,
+        seed_url: config.seed_url,
+        team_secret: config.team_secret,
     })
 }
 
@@ -1620,6 +1891,36 @@ pub struct P2pSyncStatus {
     pub last_sync_at: Option<String>,
     pub members: Vec<TeamMember>,
     pub owner_node_id: Option<String>,
+    pub seed_url: Option<String>,
+    pub team_secret: Option<String>,
+}
+
+#[tauri::command]
+pub async fn p2p_save_seed_config(
+    seed_url: Option<String>,
+    team_secret: Option<String>,
+    opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
+) -> Result<(), String> {
+    let workspace_path = opencode_state
+        .workspace_path
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or("No workspace path set")?;
+
+    let mut config = read_p2p_config(&workspace_path)?.unwrap_or_default();
+    if let Some(url) = seed_url {
+        config.seed_url = if url.is_empty() { None } else { Some(url) };
+    }
+    if let Some(secret) = team_secret {
+        config.team_secret = if secret.is_empty() {
+            None
+        } else {
+            Some(secret)
+        };
+    }
+    write_p2p_config(&workspace_path, Some(&config))?;
+    Ok(())
 }
 
 // ─── Skills Contribution Tracking ────────────────────────────────────────
@@ -1800,6 +2101,9 @@ mod tests {
             &mut node,
             team_dir.to_str().unwrap(),
             tmp.path().to_str().unwrap(),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -2232,6 +2536,9 @@ mod tests {
             &mut node,
             team_dir.to_str().unwrap(),
             workspace,
+            None,
+            None,
+            None,
             None,
             None,
             None,

@@ -42,7 +42,7 @@ import {
   useChannelGatewayInit,
   useGitReposInit,
   useCronInit,
-  useOssSyncInit,
+
   useExternalLinkHandler,
   useTauriBodyClass,
   useSetupGuide,
@@ -57,6 +57,7 @@ import {
   useResizablePanels,
 } from "@/hooks/useFileEditorState";
 import { useMCPFileWatcher } from "@/hooks/useMCPFileWatcher";
+import { useTeamModeStore } from "@/stores/team-mode";
 
 import { AppSidebar, SidebarIconGroup } from "@/components/app-sidebar";
 import { ChatPanel } from "@/components/chat/ChatPanel";
@@ -444,7 +445,6 @@ function AppContent() {
   useChannelGatewayInit();
   useGitReposInit();
   useCronInit();
-  useOssSyncInit();
   useMCPFileWatcher(workspacePath);
   useExternalLinkHandler();
   useLayoutModeShortcut();
@@ -945,6 +945,7 @@ function App() {
   const openCodeReady = useWorkspaceStore((s) => s.openCodeReady);
   const { showSetupGuide, dependencies, handleRecheck, handleSetupContinue } = useSetupGuide(openCodeReady);
   const { showConsentDialog, setShowConsentDialog } = useTelemetryConsent(showSetupGuide);
+  const devUnlocked = useTeamModeStore(s => s.devUnlocked)
 
   if (spotlightMode) {
     return (
@@ -994,6 +995,11 @@ function App() {
     <div className="h-screen w-screen rounded-2xl overflow-hidden bg-background">
       <SSEProvider />
       {mainContent}
+      {devUnlocked && (
+        <div className="fixed bottom-2 right-2 z-50 text-[10px] font-mono font-bold text-orange-500 bg-orange-500/10 border border-orange-500/30 px-1.5 py-0.5 rounded pointer-events-none">
+          DEV
+        </div>
+      )}
     </div>
   ) : (
     <>

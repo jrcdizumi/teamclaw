@@ -19,6 +19,8 @@ export interface BuildConfig {
       supportsVision?: boolean
     }
     lockLlmConfig: boolean
+    /** Pre-configured seed node URL. If set, pre-fills join/owner seed forms. */
+    seedUrl?: string
   }
   app: {
     name: string
@@ -28,9 +30,6 @@ export interface BuildConfig {
     teamMode: boolean
     updater: boolean
     channels: boolean | ChannelsFeatureConfig
-  }
-  oss?: {
-    fcEndpoint: string
   }
   defaults: {
     locale: string

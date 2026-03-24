@@ -78,14 +78,12 @@ export const useTeamModeStore = create<TeamModeState>((set, get) => ({
         model: status.llm.model,
         modelName: status.llm.modelName || status.llm.model,
       }
-      set({ teamMode: true, teamModelConfig: config })
+      set({ teamModelConfig: config })
     } else {
-      const wasTeamMode = get().teamMode
-      set({ teamMode: false, teamModelConfig: null })
-      if (wasTeamMode) {
-        await get().clearTeamMode(_workspacePath)
-      }
+      set({ teamModelConfig: null })
     }
+
+    // Team mode is determined by P2P sync status
     // Load user's role (non-critical)
     try {
       const { invoke } = await import('@tauri-apps/api/core')
@@ -196,6 +194,10 @@ export const useTeamModeStore = create<TeamModeState>((set, get) => ({
 
   setDevUnlocked: (unlocked: boolean) => {
     set({ devUnlocked: unlocked })
+    // Refresh file tree so hidden files appear/disappear
+    import('./workspace').then(({ useWorkspaceStore }) => {
+      useWorkspaceStore.getState().refreshFileTree()
+    })
   },
 
   clearTeamMode: async (workspacePath?: string) => {
@@ -288,3 +290,4 @@ export const useTeamModeStore = create<TeamModeState>((set, get) => ({
     } catch { /* ignore */ }
   },
 }))
+

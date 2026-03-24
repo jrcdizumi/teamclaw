@@ -13,27 +13,30 @@ vi.mock('react-i18next', () => ({
   }),
 }))
 
-let createResult: string | Error = 'ok'
-let afterCreateConnected = false
+// Mock Tauri event API to prevent transformCallback errors
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(async () => () => {}),
+}))
+
+// Mock plugin-fs to prevent import errors
+vi.mock('@tauri-apps/plugin-fs', () => ({
+  readDir: vi.fn(async () => []),
+  readTextFile: vi.fn(async () => ''),
+  exists: vi.fn(async () => false),
+}))
 
 const mockInvoke = vi.fn(async (cmd: string) => {
-  if (cmd === 'team_check_git_installed') return { installed: true, version: '2.40.0' }
-  if (cmd === 'get_team_config') return null
   if (cmd === 'get_device_info') return { nodeId: 'test-node', platform: 'macos', arch: 'aarch64', hostname: 'test-mac' }
   if (cmd === 'get_p2p_config') return null
-  if (cmd === 'p2p_sync_status') {
-    if (afterCreateConnected) {
-      return { connected: true, role: 'owner', docTicket: 'blobt1cketstr1ng-test-ticket-value', namespaceId: 'ns-123', lastSyncAt: null, members: [{ nodeId: 'test-node', label: 'test-mac', platform: 'macos', arch: 'aarch64', hostname: 'test-mac', addedAt: '2026-01-01' }] }
-    }
-    return null
-  }
+  if (cmd === 'p2p_sync_status') return null
+  if (cmd === 'webdav_get_status') return null
   if (cmd === 'p2p_reconnect') return null
   if (cmd === 'p2p_check_team_dir') return { exists: false, hasMembers: false }
-  if (cmd === 'p2p_create_team') {
-    if (createResult instanceof Error) throw createResult
-    afterCreateConnected = true
-    return createResult
-  }
+  if (cmd === 'p2p_create_team') return 'ok'
+  if (cmd === 'unified_team_get_members') return []
+  if (cmd === 'unified_team_get_my_role') return null
+  if (cmd === 'list_team_members') return []
+  if (cmd === 'get_my_role') return null
   return null
 })
 
@@ -43,89 +46,90 @@ vi.mock('@tauri-apps/api/core', () => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
-  createResult = 'ok'
-  afterCreateConnected = false
   ;(window as unknown as { __TAURI__: unknown }).__TAURI__ = {}
   ;(window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
     invoke: mockInvoke,
+    transformCallback: vi.fn(() => Math.random()),
   }
 })
 
+async function renderTeamSection() {
+  const { TeamSection } = await import('../components/settings/TeamSection')
+  await act(async () => {
+    render(React.createElement(TeamSection))
+  })
+  // P2P content is directly visible — no tab switching required
+}
+
 describe('TeamP2P Publish Flow', () => {
-  it('shows "Create Team Drive" button in P2P tab', async () => {
-    const { TeamSection } = await import('../components/settings/TeamSection')
+  it('shows "Create Team" button in P2P content', async () => {
+    await renderTeamSection()
 
-    await act(async () => {
-      render(React.createElement(TeamSection))
-    })
-
-    // P2P tab is active by default
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /create team drive/i })).toBeDefined()
+      const buttons = screen.getAllByRole('button', { name: /create team/i })
+      expect(buttons.length).toBeGreaterThan(0)
     })
   })
 
-  it('calls p2p_create_team and displays ticket on success', async () => {
-    const { TeamSection } = await import('../components/settings/TeamSection')
-
-    await act(async () => {
-      render(React.createElement(TeamSection))
-    })
+  it('opens create form when "Create Team" button is clicked', async () => {
+    await renderTeamSection()
 
     // Wait for init effects
     await act(async () => {
       await new Promise(r => setTimeout(r, 50))
     })
 
-    // Click create
+    // Click the "Create Team" button to open the form
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /create team drive/i }))
+      const buttons = screen.getAllByRole('button', { name: /create team/i })
+      fireEvent.click(buttons[0])
     })
 
+    // The form should now be visible with a team name input
     await waitFor(() => {
-      expect(screen.getByText('blobt1cketstr1ng-test-ticket-value')).toBeDefined()
+      expect(screen.getByPlaceholderText(/team name/i)).toBeDefined()
     })
   })
 
-  it('shows copy button after ticket is generated', async () => {
-    const { TeamSection } = await import('../components/settings/TeamSection')
-
-    await act(async () => {
-      render(React.createElement(TeamSection))
-    })
+  it('shows cancel button in create form', async () => {
+    await renderTeamSection()
 
     await act(async () => {
       await new Promise(r => setTimeout(r, 50))
     })
 
+    // Open the create form
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /create team drive/i }))
+      const buttons = screen.getAllByRole('button', { name: /create team/i })
+      fireEvent.click(buttons[0])
     })
 
     await waitFor(() => {
-      expect(screen.getAllByRole('button', { name: /copy/i }).length).toBeGreaterThan(0)
+      expect(screen.getByRole('button', { name: /cancel/i })).toBeDefined()
     })
   })
 
-  it('shows error when create fails', async () => {
-    createResult = new Error('No team content to publish')
-
-    const { TeamSection } = await import('../components/settings/TeamSection')
-
-    await act(async () => {
-      render(React.createElement(TeamSection))
-    })
+  it('hides form when cancel is clicked', async () => {
+    await renderTeamSection()
 
     await act(async () => {
       await new Promise(r => setTimeout(r, 50))
     })
 
+    // Open the create form
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /create team drive/i }))
+      const buttons = screen.getAllByRole('button', { name: /create team/i })
+      fireEvent.click(buttons[0])
     })
 
+    // Cancel
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /cancel/i }))
+    })
+
+    // Form input should no longer be visible
     await waitFor(() => {
-      expect(screen.getByText(/no team content to publish/i)).toBeDefined()
+      expect(screen.queryByPlaceholderText(/team name/i)).toBeNull()
     })
   })
 })

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, act } from '@testing-library/react'
+import { render, screen, act } from '@testing-library/react'
 import * as React from 'react'
 
 // Mock react-i18next
@@ -14,12 +14,13 @@ vi.mock('react-i18next', () => ({
 }))
 
 const mockInvoke = vi.fn(async (cmd: string) => {
-  if (cmd === 'team_check_git_installed') return { installed: true, version: '2.40.0' }
-  if (cmd === 'get_team_config') return null
+  if (cmd === 'p2p_sync_status') return null
+  if (cmd === 'webdav_get_status') return null
   if (cmd === 'get_device_info') return { nodeId: 'test-node', platform: 'macos', arch: 'aarch64', hostname: 'test-mac' }
   if (cmd === 'get_p2p_config') return null
-  if (cmd === 'p2p_sync_status') return null
   if (cmd === 'p2p_reconnect') return null
+  if (cmd === 'unified_team_get_members') return []
+  if (cmd === 'unified_team_get_my_role') return null
   return null
 })
 
@@ -28,65 +29,65 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: mockInvoke,
 }))
 
+// Mock Tauri event API to prevent transformCallback errors
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(async () => () => {}),
+}))
+
+// Mock plugin-fs to prevent import errors
+vi.mock('@tauri-apps/plugin-fs', () => ({
+  readTextFile: vi.fn(async () => ''),
+  exists: vi.fn(async () => false),
+}))
+
 // Mock window.__TAURI__ to simulate desktop environment
 beforeEach(() => {
   vi.clearAllMocks()
   ;(window as unknown as { __TAURI__: unknown }).__TAURI__ = {}
   ;(window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
     invoke: mockInvoke,
+    transformCallback: vi.fn((_callback: unknown) => {
+      const id = Math.random()
+      return id
+    }),
   }
 })
 
-describe('TeamSection Tab Switcher', () => {
-  it('renders Git and P2P tabs', async () => {
+describe('TeamSection (no tab switcher)', () => {
+  it('renders without any tabs (tab switcher was removed)', async () => {
     const { TeamSection } = await import('../components/settings/TeamSection')
 
     await act(async () => {
       render(React.createElement(TeamSection))
     })
 
-    expect(screen.getByRole('tab', { name: /git/i })).toBeDefined()
-    expect(screen.getByRole('tab', { name: /p2p/i })).toBeDefined()
+    // The tab switcher no longer exists — no tab roles should be present
+    const tabs = screen.queryAllByRole('tab')
+    expect(tabs.length).toBe(0)
   })
 
-  it('defaults to P2P tab', async () => {
+  it('renders a heading for the Team section', async () => {
     const { TeamSection } = await import('../components/settings/TeamSection')
 
     await act(async () => {
       render(React.createElement(TeamSection))
     })
 
-    const p2pTab = screen.getByRole('tab', { name: /p2p/i })
-    expect(p2pTab.getAttribute('aria-selected')).toBe('true')
+    // SectionHeader renders an h3 with the team title
+    const headings = screen.getAllByRole('heading')
+    expect(headings.length).toBeGreaterThan(0)
   })
 
-  it('switches to Git tab on click', async () => {
+  it('renders P2P config content directly without tab navigation', async () => {
     const { TeamSection } = await import('../components/settings/TeamSection')
 
     await act(async () => {
       render(React.createElement(TeamSection))
     })
 
-    const gitTab = screen.getByRole('tab', { name: /git/i })
-    fireEvent.click(gitTab)
-
-    expect(gitTab.getAttribute('aria-selected')).toBe('true')
-    const p2pTab = screen.getByRole('tab', { name: /p2p/i })
-    expect(p2pTab.getAttribute('aria-selected')).toBe('false')
-  })
-
-  it('preserves P2P tab content when switching back', async () => {
-    const { TeamSection } = await import('../components/settings/TeamSection')
-
-    await act(async () => {
-      render(React.createElement(TeamSection))
-    })
-
-    // Switch to Git
-    fireEvent.click(screen.getByRole('tab', { name: /git/i }))
-    // Switch back to P2P
-    fireEvent.click(screen.getByRole('tab', { name: /p2p/i }))
-
-    expect(screen.getByRole('tab', { name: /p2p/i }).getAttribute('aria-selected')).toBe('true')
+    // P2P content is always visible — no S3 or WebDAV tabs exist
+    const tabs = screen.queryAllByRole('tab')
+    expect(tabs.every(t => !t.textContent?.includes('S3'))).toBe(true)
+    expect(tabs.every(t => !t.textContent?.includes('WebDAV'))).toBe(true)
   })
 })

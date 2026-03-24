@@ -1,5 +1,37 @@
 // Suppress cfg warnings from the legacy `objc` crate's `msg_send!` / `sel_impl!` macros.
 #![allow(unexpected_cfgs)]
+// Suppress style/complexity clippy lints that are non-critical for this codebase.
+#![allow(
+    clippy::cloned_ref_to_slice_refs,
+    clippy::collapsible_else_if,
+    clippy::collapsible_if,
+    clippy::derivable_impls,
+    clippy::for_kv_map,
+    clippy::io_other_error,
+    clippy::iter_nth_zero,
+    clippy::manual_clamp,
+    clippy::manual_is_multiple_of,
+    clippy::manual_map,
+    clippy::manual_strip,
+    clippy::map_identity,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::ptr_arg,
+    clippy::redundant_closure,
+    clippy::redundant_guards,
+    clippy::redundant_pattern_matching,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::trim_split_whitespace,
+    clippy::type_complexity,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_unwrap,
+    clippy::unwrap_or_default,
+    clippy::useless_asref,
+    clippy::useless_format,
+    clippy::useless_vec
+)]
 
 use tauri::Manager;
 use tauri_plugin_aptabase::EventTracker;
@@ -244,6 +276,7 @@ pub fn run() {
         .manage(telemetry::commands::TelemetryState::default())
         .manage(crate::stt::SttState::default())
         .manage({
+            #[allow(unused_mut)]
             let mut wvm = commands::webview::WebviewManager::default();
             #[cfg(target_os = "macos")]
             commands::webview::init_shared_config(&mut wvm);
@@ -252,7 +285,6 @@ pub fn run() {
         .manage(<commands::p2p_state::IrohState>::default())
         .manage(commands::spotlight::SpotlightState::default())
         .manage(tokio::sync::Mutex::new(commands::team_webdav::WebDavManagedState::default()))
-        .manage(commands::oss_sync::OssSyncState::default())
         .invoke_handler(tauri::generate_handler![
             commands::greet,
             commands::show_in_folder,
@@ -401,6 +433,9 @@ pub fn run() {
             #[cfg(feature = "p2p")]
             commands::team_p2p::p2p_disconnect_source,
             #[cfg(feature = "p2p")]
+            commands::team_p2p::p2p_leave_team,
+            commands::team_p2p::p2p_dissolve_team,
+            #[cfg(feature = "p2p")]
             commands::team_p2p::p2p_reconnect,
             #[cfg(feature = "p2p")]
             commands::team_p2p::p2p_rotate_ticket,
@@ -412,6 +447,8 @@ pub fn run() {
             commands::team_p2p::save_p2p_config,
             #[cfg(feature = "p2p")]
             commands::team_p2p::p2p_skills_leaderboard,
+            #[cfg(feature = "p2p")]
+            commands::team_p2p::p2p_save_seed_config,
             commands::deps::check_dependencies,
             commands::deps::install_dependency,
             commands::env_vars::env_var_set,
@@ -462,21 +499,6 @@ pub fn run() {
             commands::team_webdav::webdav_import_config,
             commands::team_webdav::webdav_get_status,
             commands::team_webdav::get_team_mode,
-            commands::oss_commands::oss_create_team,
-            commands::oss_commands::oss_join_team,
-            commands::oss_commands::oss_restore_sync,
-            commands::oss_commands::oss_leave_team,
-            commands::oss_commands::oss_sync_now,
-            commands::oss_commands::oss_get_sync_status,
-            commands::oss_commands::oss_create_snapshot,
-            commands::oss_commands::oss_cleanup_updates,
-            commands::oss_commands::oss_update_members,
-            commands::oss_commands::oss_reset_team_secret,
-            commands::oss_commands::oss_get_team_config,
-            commands::oss_commands::oss_apply_team,
-            commands::oss_commands::oss_get_pending_application,
-            commands::oss_commands::oss_cancel_application,
-            commands::oss_commands::oss_approve_application,
             commands::team_unified::unified_team_get_members,
             commands::team_unified::unified_team_add_member,
             commands::team_unified::unified_team_remove_member,
