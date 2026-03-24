@@ -50,9 +50,9 @@ pub struct IrohNode {
     gossip: Gossip,
     docs: iroh_docs::protocol::Docs,
     router: iroh::protocol::Router,
-    author: iroh_docs::AuthorId,
+    pub(crate) author: iroh_docs::AuthorId,
     /// Currently active team document (set after create/join)
-    active_doc: Option<iroh_docs::api::Doc>,
+    pub(crate) active_doc: Option<iroh_docs::api::Doc>,
     /// Paths being written by remote sync — suppresses fs watcher feedback loop
     suppressed_paths: Arc<Mutex<HashSet<std::path::PathBuf>>>,
 }
