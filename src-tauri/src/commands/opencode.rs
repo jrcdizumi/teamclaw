@@ -1213,9 +1213,9 @@ async fn get_server_paths(port: u16) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
-/// Stop OpenCode server
-#[tauri::command]
-pub async fn stop_opencode(state: State<'_, OpenCodeState>) -> Result<(), String> {
+/// Stop OpenCode sidecar (production) or clear running state (dev). Shared by the
+/// `stop_opencode` command and application exit (`RunEvent::Exit`).
+pub async fn shutdown_opencode(state: &OpenCodeState) -> Result<(), String> {
     let is_dev_mode = *state.is_dev_mode.lock().map_err(|e| e.to_string())?;
     let port = *state.port.lock().map_err(|e| e.to_string())?;
 
@@ -1267,6 +1267,12 @@ pub async fn stop_opencode(state: State<'_, OpenCodeState>) -> Result<(), String
     }
 
     Ok(())
+}
+
+/// Stop OpenCode server
+#[tauri::command]
+pub async fn stop_opencode(state: State<'_, OpenCodeState>) -> Result<(), String> {
+    shutdown_opencode(&state).await
 }
 
 // ─── OpenCode DB allowlist commands ──────────────────────────────────
