@@ -166,7 +166,17 @@
     "confirmDelete": "确定要删除 {{name}}{{suffix}} 吗？",
     "noFilesFound": "未找到文件",
     "noFilesMatchFilter": "没有匹配的文件",
-    "filterPlaceholder": "过滤文件..."
+    "filterPlaceholder": "过滤文件...",
+    "revealActiveFile": "在文件树中定位",
+    "copyFile": "复制",
+    "cutFile": "剪切",
+    "pasteFile": "粘贴",
+    "copied": "已复制 {{count}} 项",
+    "cut": "已剪切 {{count}} 项",
+    "pasted": "已粘贴",
+    "pasteFailed": "粘贴失败",
+    "externalDropped": "已复制 {{count}} 个文件",
+    "externalDropFailed": "复制文件失败"
   },
   "git": {
     "modified": "已修改",
@@ -1134,6 +1144,7 @@
       }
     },
     "cron": {
+      "advancedOptions": "高级选项",
       "active": "运行中",
       "paused": "已暂停",
       "lastRun": "上次运行",
