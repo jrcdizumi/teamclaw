@@ -1,3 +1,4 @@
+use super::i18n;
 use super::session::SessionMapping;
 use super::wecom_config::{WeComConfig, WeComGatewayStatus, WeComGatewayStatusResponse};
 use futures_util::stream::SplitSink;
@@ -58,6 +59,7 @@ pub struct WeComGateway {
     config: Arc<RwLock<WeComConfig>>,
     session_mapping: SessionMapping,
     opencode_port: u16,
+    workspace_path: String,
     shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
     status: Arc<RwLock<WeComGatewayStatusResponse>>,
     is_running: Arc<RwLock<bool>>,
@@ -128,11 +130,12 @@ enum WsExitReason {
 }
 
 impl WeComGateway {
-    pub fn new(opencode_port: u16, session_mapping: SessionMapping) -> Self {
+    pub fn new(opencode_port: u16, session_mapping: SessionMapping, workspace_path: String) -> Self {
         Self {
             config: Arc::new(RwLock::new(WeComConfig::default())),
             session_mapping,
             opencode_port,
+            workspace_path,
             shutdown_tx: Arc::new(RwLock::new(None)),
             status: Arc::new(RwLock::new(WeComGatewayStatusResponse::default())),
             is_running: Arc::new(RwLock::new(false)),
@@ -622,17 +625,18 @@ impl WeComGateway {
         // Check for /answer command — routes reply to the most recent pending question
         if let Some(answer_text) = super::PendingQuestionStore::parse_answer_command(&text_content)
         {
+            let locale = i18n::get_locale(&self.workspace_path);
             if let Some(qid) = self.pending_questions.try_answer(answer_text).await {
                 println!(
                     "[WeCom] Question {} answered via /answer: {}",
                     qid, answer_text
                 );
                 let _ = self
-                    .send_reply(&req_id, &format!("✓ 已回复: {}", answer_text), &ws_sink)
+                    .send_reply(&req_id, &i18n::t(i18n::MsgKey::AnswerSubmitted(answer_text), locale), &ws_sink)
                     .await;
             } else {
                 let _ = self
-                    .send_reply(&req_id, "当前没有待回复的问题", &ws_sink)
+                    .send_reply(&req_id, &i18n::t(i18n::MsgKey::NoPendingQuestions, locale), &ws_sink)
                     .await;
             }
             return;
@@ -715,16 +719,13 @@ impl WeComGateway {
                     }),
                     notify_fn: Some(Box::new(move |reason| {
                         Box::pin(async move {
+                            let locale = i18n::get_locale(&gateway2.workspace_path);
                             let msg = match reason {
-                                RejectReason::Timeout => "Your message timed out waiting in queue.",
-                                RejectReason::QueueFull => {
-                                    "Too many messages queued. Please try again later."
-                                }
-                                RejectReason::SessionClosed => {
-                                    "Your message could not be processed. Please resend."
-                                }
+                                RejectReason::Timeout => i18n::t(i18n::MsgKey::QueueTimeout, locale),
+                                RejectReason::QueueFull => i18n::t(i18n::MsgKey::QueueFull, locale),
+                                RejectReason::SessionClosed => i18n::t(i18n::MsgKey::MessageCouldNotBeProcessed, locale),
                             };
-                            let _ = gateway2.send_reply(&req_id2, msg, &ws_sink2).await;
+                            let _ = gateway2.send_reply(&req_id2, &msg, &ws_sink2).await;
                         })
                     })),
                 },
@@ -762,14 +763,13 @@ impl WeComGateway {
         let parts: Vec<&str> = content.splitn(2, ' ').collect();
         let cmd = parts[0].to_lowercase();
         let arg = parts.get(1).copied().unwrap_or("").trim();
+        let locale = i18n::get_locale(&self.workspace_path);
 
         let reply = match cmd.as_str() {
-            "/help" => {
-                "Available commands:\n/help - Show this help\n/model [name] - List or switch models\n/sessions [id] - List or bind sessions\n/reset - Start new session\n/stop - Stop current processing".to_string()
-            }
+            "/help" => i18n::t(i18n::MsgKey::HelpWecom, locale),
             "/reset" => {
                 self.session_mapping.remove_session(session_key).await;
-                "Session reset. Next message will start a new conversation.".to_string()
+                i18n::t(i18n::MsgKey::SessionReset, locale)
             }
             "/model" => {
                 super::handle_model_command(
@@ -777,6 +777,7 @@ impl WeComGateway {
                     &self.session_mapping,
                     session_key,
                     arg,
+                    locale,
                 )
                 .await
             }
@@ -786,6 +787,7 @@ impl WeComGateway {
                     &self.session_mapping,
                     session_key,
                     arg,
+                    locale,
                 )
                 .await
             }
@@ -794,10 +796,11 @@ impl WeComGateway {
                     self.opencode_port,
                     &self.session_mapping,
                     session_key,
+                    locale,
                 )
                 .await
             }
-            _ => format!("Unknown command: {}", cmd),
+            _ => i18n::t(i18n::MsgKey::UnknownCommand(&cmd), locale),
         };
 
         self.send_reply(req_id, &reply, ws_sink).await
@@ -1275,6 +1278,7 @@ impl WeComGateway {
                                         let text = super::format_question_message(
                                             &[q.clone()],
                                             &question_id,
+                                            i18n::get_locale(&self.workspace_path),
                                         );
                                         let _ = self
                                             .send_stream_chunk(
@@ -1534,13 +1538,14 @@ impl WeComGateway {
     async fn handle_enter_chat(&self, req_id: &str, ws_sink: &WsSink) {
         use futures_util::SinkExt;
 
+        let locale = i18n::get_locale(&self.workspace_path);
         let welcome = serde_json::json!({
             "cmd": "aibot_respond_welcome_msg",
             "headers": { "req_id": req_id },
             "body": {
                 "msgtype": "text",
                 "text": {
-                    "content": "你好！我是 AI 助手。直接发消息给我开始对话，发送 /help 查看可用命令。"
+                    "content": i18n::t(i18n::MsgKey::WecomWelcome, locale)
                 }
             }
         });
