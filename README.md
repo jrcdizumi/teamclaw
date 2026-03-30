@@ -4,20 +4,35 @@
 [![CI](https://github.com/diffrent-ai-studio/teamclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/diffrent-ai-studio/teamclaw/actions)
 [![Contributors](https://img.shields.io/github/contributors/diffrent-ai-studio/teamclaw.svg)](https://github.com/diffrent-ai-studio/teamclaw/graphs/contributors)
 
-AI Agent Desktop Platform
+Local AI agents built on OpenCode — the foundation for digital employees
 
 English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-![TeamClaw Screenshot](_assets/screenshot.jpg)
+## UI Screenshots
+
+### Home
+
+![TeamClaw Home](images/home.png)
+
+### Channels
+
+![TeamClaw Channels](images/channel.png)
+
+### Team
+
+![TeamClaw Team](images/team.png)
 
 ## Features
 
 - Three-column layout (Sidebar, Chat, Detail Panel)
 - OpenCode integration for Agent capabilities
+- Channel gateways: Discord, Feishu, Email, Kook, WeCom, WeChat
+- Automation (Cron) for scheduled tasks
+- Team collaboration modes: P2P and S3/OSS
 - MCP (Model Context Protocol) support for enterprise systems
-- Skills/Plugins extension system
+- Skills/Plugins extension system with workspace and global skill sources
+- Knowledge base indexing/search and token usage/telemetry settings
 - Local file operations with permission management
-- **Team Git Sync**: Share Skills, MCP configurations, and knowledge bases across your team via a shared Git repository
 
 ## Contributing
 
@@ -114,7 +129,10 @@ Skips automatically if already up to date. You can also pin a version: `pnpm upd
 
 ## Team Collaboration
 
-TeamClaw supports team collaboration via Git repositories, allowing team members to share Skills, MCP configurations, and knowledge bases.
+TeamClaw supports multiple team collaboration modes:
+
+- **P2P mode**: Local-network team collaboration with ticket-based join and member roles
+- **S3/OSS mode**: Cloud-backed team sync
 
 ### Setting Up a Team Repository
 
@@ -130,7 +148,7 @@ TeamClaw supports team collaboration via Git repositories, allowing team members
 
 The team repository automatically syncs the following:
 
-- **Skills**: `.agent/skills/` - Shared Agent skills
+- **Skills**: `skills/` - Shared Agent skills
 - **MCP Config**: `.mcp/` - MCP server configurations
 - **Knowledge Base**: `knowledge/` - Team knowledge base documents
 

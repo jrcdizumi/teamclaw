@@ -11,11 +11,11 @@
   "app": {
     "name": "TeamClaw",
     "shortName": "teamclaw",
-    "uiVariant": "workspace"
+    "uiVariant": "default"
   },
   "features": {
     "advancedMode": true,
-    "teamMode": true,
+    "teamMode": false,
     "updater": true,
     "channels": {
       "discord": true,
