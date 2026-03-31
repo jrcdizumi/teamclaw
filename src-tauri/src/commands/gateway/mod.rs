@@ -157,7 +157,13 @@ impl Default for GatewayState {
 /// Ensure the shared session mapping is initialized with persistence
 async fn ensure_session_initialized(gateway_state: &GatewayState, workspace_path: &str) {
     let needs_init = {
-        let mut initialized = gateway_state.session_initialized.lock().unwrap();
+        let mut initialized = match gateway_state.session_initialized.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("[Gateway] session_initialized mutex was poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         if *initialized {
             false
         } else {
@@ -1182,9 +1188,10 @@ pub async fn get_channel_config(
     opencode_state: State<'_, OpenCodeState>,
 ) -> Result<ChannelsConfig, String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
 
@@ -1199,9 +1206,10 @@ pub async fn save_channel_config(
     opencode_state: State<'_, OpenCodeState>,
 ) -> Result<(), String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
 
@@ -1227,9 +1235,10 @@ pub async fn save_discord_config(
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
 
@@ -1261,9 +1270,10 @@ pub async fn set_config_locale(
     locale: String,
 ) -> Result<(), String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
     let mut config = read_config(&workspace_path)?;
@@ -1277,16 +1287,13 @@ pub async fn start_gateway(
     opencode_state: State<'_, OpenCodeState>,
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
-    // Get OpenCode port
-    let port = *opencode_state.port.lock().map_err(|e| e.to_string())?;
-
-    // Get workspace path for config
-    let workspace_path = opencode_state
-        .workspace_path
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clone()
-        .ok_or("No workspace path set. Please select a workspace first.")?;
+    // Get OpenCode port and workspace path
+    let (port, workspace_path) = {
+        let inner = opencode_state.inner.lock().map_err(|e| e.to_string())?;
+        let ws = inner.workspace_path.clone()
+            .ok_or("No workspace path set. Please select a workspace first.")?;
+        (inner.port, ws)
+    };
 
     // Read config
     println!("[Gateway] Reading config from: {}", workspace_path);
@@ -1390,9 +1397,10 @@ pub async fn save_feishu_config(
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
 
@@ -1423,14 +1431,12 @@ pub async fn start_feishu_gateway(
     opencode_state: State<'_, OpenCodeState>,
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
-    let port = *opencode_state.port.lock().map_err(|e| e.to_string())?;
-
-    let workspace_path = opencode_state
-        .workspace_path
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clone()
-        .ok_or("No workspace path set. Please select a workspace first.")?;
+    let (port, workspace_path) = {
+        let inner = opencode_state.inner.lock().map_err(|e| e.to_string())?;
+        let ws = inner.workspace_path.clone()
+            .ok_or("No workspace path set. Please select a workspace first.")?;
+        (inner.port, ws)
+    };
 
     let config = read_config(&workspace_path)?;
     let feishu_config = config
@@ -1552,9 +1558,10 @@ pub async fn save_email_config(
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
 
@@ -1585,14 +1592,12 @@ pub async fn start_email_gateway(
     opencode_state: State<'_, OpenCodeState>,
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
-    let port = *opencode_state.port.lock().map_err(|e| e.to_string())?;
-
-    let workspace_path = opencode_state
-        .workspace_path
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clone()
-        .ok_or("No workspace path set. Please select a workspace first.")?;
+    let (port, workspace_path) = {
+        let inner = opencode_state.inner.lock().map_err(|e| e.to_string())?;
+        let ws = inner.workspace_path.clone()
+            .ok_or("No workspace path set. Please select a workspace first.")?;
+        (inner.port, ws)
+    };
 
     let config = read_config(&workspace_path)?;
     let email_config = config
@@ -1677,9 +1682,10 @@ pub async fn gmail_authorize(
     opencode_state: State<'_, OpenCodeState>,
 ) -> Result<String, String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
 
@@ -1690,9 +1696,10 @@ pub async fn gmail_authorize(
 #[tauri::command]
 pub async fn check_gmail_auth(opencode_state: State<'_, OpenCodeState>) -> Result<bool, String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
 
@@ -1718,9 +1725,10 @@ pub async fn save_kook_config(
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
 
@@ -1751,14 +1759,12 @@ pub async fn start_kook_gateway(
     opencode_state: State<'_, OpenCodeState>,
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
-    let port = *opencode_state.port.lock().map_err(|e| e.to_string())?;
-
-    let workspace_path = opencode_state
-        .workspace_path
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clone()
-        .ok_or("No workspace path set. Please select a workspace first.")?;
+    let (port, workspace_path) = {
+        let inner = opencode_state.inner.lock().map_err(|e| e.to_string())?;
+        let ws = inner.workspace_path.clone()
+            .ok_or("No workspace path set. Please select a workspace first.")?;
+        (inner.port, ws)
+    };
 
     let config = read_config(&workspace_path)?;
     let kook_config = config
@@ -1904,9 +1910,10 @@ pub async fn save_wecom_config(
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
 
@@ -1937,14 +1944,12 @@ pub async fn start_wecom_gateway(
     opencode_state: State<'_, OpenCodeState>,
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
-    let port = *opencode_state.port.lock().map_err(|e| e.to_string())?;
-
-    let workspace_path = opencode_state
-        .workspace_path
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clone()
-        .ok_or("No workspace path set. Please select a workspace first.")?;
+    let (port, workspace_path) = {
+        let inner = opencode_state.inner.lock().map_err(|e| e.to_string())?;
+        let ws = inner.workspace_path.clone()
+            .ok_or("No workspace path set. Please select a workspace first.")?;
+        (inner.port, ws)
+    };
 
     println!(
         "[Gateway] start_wecom_gateway called, workspace={}",
@@ -2135,9 +2140,10 @@ pub async fn save_wechat_config(
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
     let workspace_path = opencode_state
-        .workspace_path
+        .inner
         .lock()
         .map_err(|e| e.to_string())?
+        .workspace_path
         .clone()
         .ok_or("No workspace path set. Please select a workspace first.")?;
 
@@ -2168,14 +2174,12 @@ pub async fn start_wechat_gateway(
     opencode_state: State<'_, OpenCodeState>,
     gateway_state: State<'_, GatewayState>,
 ) -> Result<(), String> {
-    let port = *opencode_state.port.lock().map_err(|e| e.to_string())?;
-
-    let workspace_path = opencode_state
-        .workspace_path
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clone()
-        .ok_or("No workspace path set. Please select a workspace first.")?;
+    let (port, workspace_path) = {
+        let inner = opencode_state.inner.lock().map_err(|e| e.to_string())?;
+        let ws = inner.workspace_path.clone()
+            .ok_or("No workspace path set. Please select a workspace first.")?;
+        (inner.port, ws)
+    };
 
     println!(
         "[Gateway] start_wechat_gateway called, workspace={}",
@@ -2307,8 +2311,8 @@ pub async fn poll_wechat_qr_status(
                 context_tokens: std::collections::HashMap::new(),
             };
             // Save to config if workspace is set
-            if let Ok(guard) = opencode_state.workspace_path.lock() {
-                if let Some(ref workspace_path) = *guard {
+            if let Ok(inner) = opencode_state.inner.lock() {
+                if let Some(ref workspace_path) = inner.workspace_path {
                     if let Ok(mut config) = read_config(workspace_path) {
                         let channels = config.channels.get_or_insert_with(ChannelsConfig::default);
                         channels.wechat = Some(wechat_cfg.clone());
