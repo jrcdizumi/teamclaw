@@ -846,10 +846,6 @@ fn inherent_skills_common() -> Vec<InherentSkill> {
             dirname: "ai-manage",
             content: include_str!("../../../packages/app/src/lib/skills/ai-manage/SKILL.md"),
         },
-        InherentSkill {
-            dirname: "codebase-downloader",
-            content: include_str!("../../../packages/app/src/lib/skills/codebase-downloader/SKILL.md"),
-        },
     ]
 }
 

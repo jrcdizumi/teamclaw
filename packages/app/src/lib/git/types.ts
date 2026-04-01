@@ -182,7 +182,6 @@ export const INHERENT_SKILL_NAMES = new Set([
   'macos-control',
   'windows-control',
   'using-superpowers',
-  'codebase-downloader',
 ])
 
 const DESKTOP_CONTROL_INHERENT_SLUGS = new Set(['macos-control', 'windows-control'])
