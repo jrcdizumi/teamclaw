@@ -9,7 +9,7 @@ use crate::commands::TEAMCLAW_DIR;
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
-use tauri::State;
+use tauri::{Manager, State};
 use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
@@ -43,15 +43,73 @@ fn parse_doc_type(s: &str) -> Result<DocType, String> {
 }
 
 async fn start_poll_loop(state: &OssSyncState) {
-    let manager_arc = state.manager.clone();
-    let handle = tokio::spawn(async move {
-        OssSyncManager::poll_loop(manager_arc).await;
+    // Spawn fast loop (30s signal-based)
+    let fast_arc = state.manager.clone();
+    let fast_handle = tokio::spawn(async move {
+        OssSyncManager::fast_loop(fast_arc).await;
     });
-    let mut poll_guard = state.poll_handle.lock().await;
-    if let Some(old_handle) = poll_guard.take() {
+    let mut fast_guard = state.fast_poll_handle.lock().await;
+    if let Some(old_handle) = fast_guard.take() {
         old_handle.abort();
     }
-    *poll_guard = Some(handle);
+    *fast_guard = Some(fast_handle);
+
+    // Spawn slow loop (5min full sync + compaction)
+    let slow_arc = state.manager.clone();
+    let slow_handle = tokio::spawn(async move {
+        OssSyncManager::slow_loop(slow_arc).await;
+    });
+    let mut slow_guard = state.slow_poll_handle.lock().await;
+    if let Some(old_handle) = slow_guard.take() {
+        old_handle.abort();
+    }
+    *slow_guard = Some(slow_handle);
+}
+
+/// Archive a team directory into a zip file. Returns the number of files archived.
+fn archive_team_dir(dir: &std::path::Path, dest: &std::path::Path) -> Result<usize, String> {
+    let file = std::fs::File::create(dest)
+        .map_err(|e| format!("Failed to create archive {}: {e}", dest.display()))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let mut count = 0usize;
+    fn walk_zip(
+        base: &std::path::Path,
+        current: &std::path::Path,
+        zip: &mut zip::ZipWriter<std::fs::File>,
+        options: zip::write::SimpleFileOptions,
+        count: &mut usize,
+    ) -> Result<(), String> {
+        let entries = std::fs::read_dir(current)
+            .map_err(|e| format!("Failed to read dir {}: {e}", current.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(base)
+                .map_err(|e| format!("Path strip error: {e}"))?;
+            let name = rel.to_string_lossy().to_string();
+
+            if path.is_dir() {
+                walk_zip(base, &path, zip, options, count)?;
+            } else {
+                let data = std::fs::read(&path)
+                    .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+                zip.start_file(&name, options)
+                    .map_err(|e| format!("Failed to start zip entry {name}: {e}"))?;
+                std::io::Write::write_all(zip, &data)
+                    .map_err(|e| format!("Failed to write zip entry {name}: {e}"))?;
+                *count += 1;
+            }
+        }
+        Ok(())
+    }
+
+    walk_zip(dir, dir, &mut zip, options, &mut count)?;
+    zip.finish()
+        .map_err(|e| format!("Failed to finalize archive: {e}"))?;
+    Ok(count)
 }
 
 /// Generate a 32-byte random hex string for use as a team secret.
@@ -203,6 +261,23 @@ pub async fn oss_create_team(
     }
     start_poll_loop(&state).await;
 
+    // Init shared secrets for the new team
+    {
+        if let Some(shared_state) =
+            app_handle.try_state::<crate::commands::shared_secrets::SharedSecretsState>()
+        {
+            let team_dir_path =
+                std::path::Path::new(&workspace_path).join(super::TEAM_REPO_DIR);
+            if let Err(e) = crate::commands::shared_secrets::init_shared_secrets(
+                &shared_state,
+                &team_secret,
+                &team_dir_path,
+            ) {
+                warn!("[OSS] Failed to init shared secrets: {}", e);
+            }
+        }
+    }
+
     info!("OSS team created: {team_id}");
 
     // Fire-and-forget: register team + owner key in LiteLLM via FC (FC then calls LiteLLM).
@@ -339,11 +414,38 @@ pub async fn oss_join_team(
         }
     }
 
-    // Scaffold teamclaw-team directory
+    // Archive and scaffold teamclaw-team directory.
+    // If the directory already exists (e.g. user left and is re-joining),
+    // archive it as a zip so initial_sync won't absorb stale local files
+    // back into the CRDT. The remote state is authoritative on join.
     let team_dir = format!("{}/{}", workspace_path, super::TEAM_REPO_DIR);
-    if !std::path::Path::new(&team_dir).exists() {
-        super::team::scaffold_team_dir(&team_dir)?;
+    let team_dir_path = std::path::Path::new(&team_dir);
+    if team_dir_path.exists() {
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let archive_name = format!("{}.backup_{}.zip", super::TEAM_REPO_DIR, timestamp);
+        let archive_path = std::path::Path::new(&workspace_path).join(&archive_name);
+        info!(
+            "oss_join_team: archiving existing team dir to {}",
+            archive_path.display()
+        );
+        // Best-effort archive — if it fails, log and proceed anyway
+        match archive_team_dir(team_dir_path, &archive_path) {
+            Ok(count) => info!("Archived {count} files to {}", archive_path.display()),
+            Err(e) => warn!("Failed to archive team dir (proceeding anyway): {e}"),
+        }
+        // Remove contents but keep the directory itself
+        if let Ok(entries) = std::fs::read_dir(team_dir_path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let _ = std::fs::remove_dir_all(&p);
+                } else {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
     }
+    super::team::scaffold_team_dir(&team_dir)?;
 
     // Write LLM config to .teamclaw/teamclaw.json
     let llm_config = super::team::build_llm_config(llm_base_url, llm_model, llm_model_name);
@@ -373,6 +475,23 @@ pub async fn oss_join_team(
         *guard = Some(manager);
     }
     start_poll_loop(&state).await;
+
+    // Init shared secrets for the joined team
+    {
+        if let Some(shared_state) =
+            app_handle.try_state::<crate::commands::shared_secrets::SharedSecretsState>()
+        {
+            let team_dir_path =
+                std::path::Path::new(&workspace_path).join(super::TEAM_REPO_DIR);
+            if let Err(e) = crate::commands::shared_secrets::init_shared_secrets(
+                &shared_state,
+                &team_secret,
+                &team_dir_path,
+            ) {
+                warn!("[OSS] Failed to init shared secrets: {}", e);
+            }
+        }
+    }
 
     info!("Joined OSS team: {team_id}");
 
@@ -496,6 +615,23 @@ pub async fn oss_restore_sync(
     }
     start_poll_loop(&state).await;
 
+    // Init shared secrets for the restored team
+    {
+        if let Some(shared_state) =
+            app_handle.try_state::<crate::commands::shared_secrets::SharedSecretsState>()
+        {
+            let team_dir_path =
+                std::path::Path::new(&workspace_path).join(super::TEAM_REPO_DIR);
+            if let Err(e) = crate::commands::shared_secrets::init_shared_secrets(
+                &shared_state,
+                &team_secret,
+                &team_dir_path,
+            ) {
+                warn!("[OSS] Failed to init shared secrets: {}", e);
+            }
+        }
+    }
+
     info!("Restored OSS sync for team: {team_id}");
 
     Ok(OssTeamInfo {
@@ -527,10 +663,16 @@ pub async fn oss_leave_team(
         }
     }
 
-    // Stop poll loop
+    // Stop both poll loops
     {
-        let mut poll_guard = state.poll_handle.lock().await;
-        if let Some(handle) = poll_guard.take() {
+        let mut fast_guard = state.fast_poll_handle.lock().await;
+        if let Some(handle) = fast_guard.take() {
+            handle.abort();
+        }
+    }
+    {
+        let mut slow_guard = state.slow_poll_handle.lock().await;
+        if let Some(handle) = slow_guard.take() {
             handle.abort();
         }
     }
@@ -580,10 +722,22 @@ pub async fn oss_sync_now(state: State<'_, OssSyncState>) -> Result<SyncStatus, 
 
     manager.refresh_token_if_needed().await?;
 
+    let mut any_uploaded = false;
     for doc_type in DocType::all() {
-        manager.upload_local_changes(doc_type).await?;
+        match manager.upload_local_changes(doc_type).await {
+            Ok(true) => any_uploaded = true,
+            Ok(false) => {}
+            Err(e) => return Err(e),
+        }
         manager.pull_remote_changes(doc_type).await?;
         let _ = manager.persist_local_snapshot(doc_type);
+    }
+
+    // Write signal flag so other nodes detect the manual sync quickly
+    if any_uploaded {
+        if let Err(e) = manager.write_signal_flag().await {
+            warn!("Failed to write signal flag after manual sync: {}", e);
+        }
     }
 
     let now = chrono::Utc::now().to_rfc3339();

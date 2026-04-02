@@ -1,11 +1,13 @@
 // P2P team sync via iroh-docs - bidirectional document-based file sharing
 
 use super::team_unified::{MemberRole, TeamManifest, TeamMember};
+use tauri::Manager;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::{Instant, SystemTime};
+use tokio::sync::{Mutex, RwLock};
 
 use iroh::{Endpoint, SecretKey};
 use iroh_blobs::store::fs::FsStore;
@@ -26,6 +28,212 @@ fn is_tombstone(content: &[u8]) -> bool {
 const IROH_STORAGE_DIR: &str = concat!(".", env!("APP_SHORT_NAME"), "/iroh");
 /// Filename for the persisted Ed25519 secret key
 const SECRET_KEY_FILE: &str = "secret_key";
+
+// ─── SyncEngine types ──────────────────────────────────────────────────────
+
+/// Connection status for an individual peer, derived from elapsed time since last activity.
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum PeerConnection {
+    Active,
+    Stale,
+    Lost,
+    Unknown,
+}
+
+/// Tracks the local mtime at the moment a file was last synced, enabling safe reconciliation.
+#[derive(Debug, Clone)]
+pub struct FileSyncRecord {
+    pub local_mtime_at_sync: SystemTime,
+}
+
+/// Runtime state for a single peer. Not serializable because it contains `Instant`.
+#[derive(Debug, Clone)]
+pub struct PeerState {
+    pub node_id: String,
+    pub name: String,
+    pub role: MemberRole,
+    pub last_activity: Option<Instant>,
+    pub entries_sent: u64,
+    pub entries_received: u64,
+}
+
+impl PeerState {
+    /// Derive connection quality from elapsed time since last activity.
+    pub fn connection(&self) -> PeerConnection {
+        match self.last_activity {
+            Some(t) => {
+                let elapsed = t.elapsed().as_secs();
+                if elapsed < 30 {
+                    PeerConnection::Active
+                } else if elapsed <= 120 {
+                    PeerConnection::Stale
+                } else {
+                    PeerConnection::Lost
+                }
+            }
+            None => PeerConnection::Unknown,
+        }
+    }
+}
+
+/// High-level status of the sync engine.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineStatus {
+    Connected,
+    Disconnected,
+    Reconnecting,
+}
+
+/// Health of the event stream between this node and the iroh document.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamHealth {
+    Healthy,
+    Dead,
+    Restarting,
+}
+
+/// Serializable projection of `PeerState` for the frontend.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerInfo {
+    pub node_id: String,
+    pub name: String,
+    pub role: MemberRole,
+    pub connection: PeerConnection,
+    pub last_seen_secs_ago: u64,
+    pub entries_sent: u64,
+    pub entries_received: u64,
+}
+
+/// Serializable snapshot of the entire sync engine state, sent to the frontend.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSnapshot {
+    pub status: EngineStatus,
+    pub stream_health: StreamHealth,
+    pub uptime_secs: u64,
+    pub restart_count: u32,
+    pub last_sync_at: Option<String>,
+    pub peers: Vec<PeerInfo>,
+    pub synced_files: u32,
+    pub pending_files: u32,
+}
+
+/// Central state for the P2P sync engine. Not serializable (contains `Instant`).
+pub struct SyncEngine {
+    pub status: EngineStatus,
+    pub stream_health: StreamHealth,
+    pub started_at: Instant,
+    pub restart_count: u32,
+    pub last_sync_at: Option<String>,
+    pub peers: HashMap<String, PeerState>,
+    pub file_sync_records: HashMap<String, FileSyncRecord>,
+    pub synced_files: u32,
+    pub pending_files: u32,
+}
+
+impl Default for SyncEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SyncEngine {
+    /// Create a new engine in disconnected state.
+    pub fn new() -> Self {
+        Self {
+            status: EngineStatus::Disconnected,
+            stream_health: StreamHealth::Dead,
+            started_at: Instant::now(),
+            restart_count: 0,
+            last_sync_at: None,
+            peers: HashMap::new(),
+            file_sync_records: HashMap::new(),
+            synced_files: 0,
+            pending_files: 0,
+        }
+    }
+
+    /// Build a serializable snapshot of the current engine state.
+    pub fn snapshot(&self) -> EngineSnapshot {
+        let peers: Vec<PeerInfo> = self
+            .peers
+            .values()
+            .map(|p| PeerInfo {
+                node_id: p.node_id.clone(),
+                name: p.name.clone(),
+                role: p.role.clone(),
+                connection: p.connection(),
+                last_seen_secs_ago: p.last_activity.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                entries_sent: p.entries_sent,
+                entries_received: p.entries_received,
+            })
+            .collect();
+
+        EngineSnapshot {
+            status: self.status.clone(),
+            stream_health: self.stream_health.clone(),
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            restart_count: self.restart_count,
+            last_sync_at: self.last_sync_at.clone(),
+            peers,
+            synced_files: self.synced_files,
+            pending_files: self.pending_files,
+        }
+    }
+
+    /// Record that a sync round with `node_id` has finished.
+    pub fn record_sync_finished(&mut self, node_id: &str, sent: u64, received: u64) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.entries_sent += sent;
+            peer.entries_received += received;
+            peer.last_activity = Some(Instant::now());
+        }
+        self.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+
+    /// Record that a neighbor (peer) has come online.
+    pub fn record_neighbor_up(&mut self, node_id: &str) {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.last_activity = Some(Instant::now());
+        }
+    }
+
+    /// Populate the peers map from the on-disk members manifest.
+    pub fn load_peers_from_manifest(&mut self, team_dir: &str) -> Result<(), String> {
+        if let Some(manifest) = read_members_manifest(team_dir)? {
+            for member in &manifest.members {
+                self.peers
+                    .entry(member.node_id.clone())
+                    .or_insert_with(|| PeerState {
+                        node_id: member.node_id.clone(),
+                        name: member.name.clone(),
+                        role: member.role.clone(),
+                        last_activity: None,
+                        entries_sent: 0,
+                        entries_received: 0,
+                    });
+            }
+        }
+        Ok(())
+    }
+
+    /// Record that a file has been synced with the given local mtime.
+    pub fn record_file_synced(&mut self, key: String, mtime: SystemTime) {
+        self.file_sync_records.insert(
+            key,
+            FileSyncRecord {
+                local_mtime_at_sync: mtime,
+            },
+        );
+    }
+}
+
+/// Shared, async-safe handle to the sync engine.
+pub type SyncEngineState = Arc<Mutex<SyncEngine>>;
 
 /// Load or generate a persistent Ed25519 secret key at `storage_path/secret_key`.
 fn load_or_create_secret_key(storage_path: &Path) -> Result<SecretKey, String> {
@@ -64,7 +272,12 @@ pub struct IrohNode {
     /// Currently active team document (set after create/join)
     pub(crate) active_doc: Option<iroh_docs::api::Doc>,
     /// Paths being written by remote sync — suppresses fs watcher feedback loop
-    suppressed_paths: Arc<Mutex<HashSet<std::path::PathBuf>>>,
+    suppressed_paths: Arc<Mutex<HashMap<std::path::PathBuf, Instant>>>,
+    /// Incremented on reconnect/disconnect to signal stale sync tasks to exit.
+    sync_generation_tx: tokio::sync::watch::Sender<u64>,
+    sync_generation_rx: tokio::sync::watch::Receiver<u64>,
+    /// Protects concurrent reads/writes of _team/members.json across sync tasks.
+    manifest_lock: Arc<RwLock<()>>,
 }
 
 impl IrohNode {
@@ -110,6 +323,8 @@ impl IrohNode {
             .accept(iroh_docs::ALPN, docs.clone())
             .spawn();
 
+        let (gen_tx, gen_rx) = tokio::sync::watch::channel(0u64);
+
         Ok(IrohNode {
             endpoint,
             store,
@@ -118,7 +333,10 @@ impl IrohNode {
             router,
             author,
             active_doc: None,
-            suppressed_paths: Arc::new(Mutex::new(HashSet::new())),
+            suppressed_paths: Arc::new(Mutex::new(HashMap::new())),
+            sync_generation_tx: gen_tx,
+            sync_generation_rx: gen_rx,
+            manifest_lock: Arc::new(RwLock::new(())),
         })
     }
 
@@ -137,8 +355,31 @@ impl IrohNode {
 
     /// Gracefully shut down the iroh node.
     #[allow(dead_code)]
-    pub async fn shutdown(self) {
-        self.router.shutdown().await.ok();
+    pub async fn shutdown(mut self) {
+        self.bump_sync_generation();
+        if let Some(doc) = self.active_doc.take() {
+            if tokio::time::timeout(std::time::Duration::from_secs(5), doc.leave())
+                .await
+                .is_err()
+            {
+                eprintln!("[P2P] Timed out leaving active doc during shutdown");
+            }
+        }
+        if tokio::time::timeout(std::time::Duration::from_secs(5), self.router.shutdown())
+            .await
+            .is_err()
+        {
+            eprintln!("[P2P] Timed out shutting down iroh router");
+        }
+    }
+
+    /// Bump the sync generation, causing all running sync tasks to exit.
+    /// Returns the new generation value.
+    pub fn bump_sync_generation(&self) -> u64 {
+        let new_gen = *self.sync_generation_rx.borrow() + 1;
+        let _ = self.sync_generation_tx.send(new_gen);
+        eprintln!("[P2P] Bumped sync generation to {}", new_gen);
+        new_gen
     }
 }
 
@@ -264,6 +505,7 @@ pub async fn create_team(
     owner_name: Option<String>,
     owner_email: Option<String>,
     app_handle: Option<tauri::AppHandle>,
+    engine: SyncEngineState,
 ) -> Result<String, String> {
     scaffold_team_dir(team_dir)?;
 
@@ -365,6 +607,10 @@ pub async fn create_team(
         None,           // seed_endpoint resolved later on reconnect
         HashMap::new(), // no cached peers yet for new team
         Some(workspace_path.to_string()),
+        engine,
+        node.sync_generation_rx.clone(),
+        *node.sync_generation_rx.borrow(),
+        node.manifest_lock.clone(),
     );
 
     node.active_doc = Some(doc);
@@ -393,6 +639,7 @@ pub async fn join_team_drive(
     team_dir: &str,
     workspace_path: &str,
     app_handle: Option<tauri::AppHandle>,
+    engine: SyncEngineState,
 ) -> Result<String, String> {
     use std::str::FromStr;
 
@@ -416,7 +663,7 @@ pub async fn join_team_drive(
     for attempt in 1..=10 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        file_count = write_doc_entries_to_disk(&doc, &node.store, team_dir)
+        file_count = write_doc_entries_to_disk(&doc, &node.store, team_dir, app_handle.as_ref())
             .await
             .unwrap_or(0);
 
@@ -440,7 +687,10 @@ pub async fn join_team_drive(
 
         // If we've synced some files, no need to wait the full 10s
         if file_count > 0 && attempt >= 3 {
-            eprintln!("[P2P] Got {} files after {}s, proceeding", file_count, attempt);
+            eprintln!(
+                "[P2P] Got {} files after {}s, proceeding",
+                file_count, attempt
+            );
             break;
         }
     }
@@ -491,6 +741,7 @@ pub async fn join_team_drive(
 
     // Reconcile offline edits (primarily for re-join scenarios)
     let is_owner = manifest_owner.as_deref() == Some(&joiner_node_id);
+    let temp_engine: Arc<Mutex<SyncEngine>> = Arc::new(Mutex::new(SyncEngine::new()));
     if let Err(e) = reconcile_disk_and_doc(
         &doc,
         &node.store,
@@ -498,6 +749,8 @@ pub async fn join_team_drive(
         team_dir,
         is_owner,
         &joiner_role,
+        &temp_engine,
+        app_handle.as_ref(),
     )
     .await
     {
@@ -530,6 +783,10 @@ pub async fn join_team_drive(
         seed_ep,
         HashMap::new(), // no cached peers yet for new joiner
         Some(workspace_path.to_string()),
+        engine,
+        node.sync_generation_rx.clone(),
+        *node.sync_generation_rx.borrow(),
+        node.manifest_lock.clone(),
     );
 
     node.active_doc = Some(doc);
@@ -553,6 +810,7 @@ async fn write_doc_entries_to_disk(
     doc: &iroh_docs::api::Doc,
     store: &FsStore,
     team_dir: &str,
+    app_handle: Option<&tauri::AppHandle>,
 ) -> Result<usize, String> {
     use futures_lite::StreamExt;
     use std::pin::pin;
@@ -569,6 +827,7 @@ async fn write_doc_entries_to_disk(
     std::fs::create_dir_all(team_path).map_err(|e| format!("Failed to create team dir: {}", e))?;
 
     let mut file_count = 0;
+    let mut secrets_changed = false;
     while let Some(entry_result) = entries.next().await {
         let entry = entry_result.map_err(|e| format!("Failed to read entry: {}", e))?;
         let key = String::from_utf8_lossy(entry.key()).to_string();
@@ -595,7 +854,21 @@ async fn write_doc_entries_to_disk(
         }
         std::fs::write(&file_path, &content)
             .map_err(|e| format!("Failed to write '{}': {}", key, e))?;
+        if key.starts_with("_secrets/") {
+            secrets_changed = true;
+        }
         file_count += 1;
+    }
+
+    if secrets_changed {
+        if let Some(app) = app_handle {
+            let shared_state = app.state::<crate::commands::shared_secrets::SharedSecretsState>();
+            if let Err(e) = crate::commands::shared_secrets::load_all_secrets(&shared_state) {
+                eprintln!("[P2P] Failed to reload shared secrets: {}", e);
+            }
+            use tauri::Emitter;
+            let _ = app.emit("secrets-changed", ());
+        }
     }
 
     Ok(file_count)
@@ -611,6 +884,8 @@ async fn reconcile_disk_and_doc(
     team_dir: &str,
     is_owner: bool,
     role: &MemberRole,
+    engine: &Arc<Mutex<SyncEngine>>,
+    app_handle: Option<&tauri::AppHandle>,
 ) -> Result<(usize, usize), String> {
     use futures_lite::StreamExt;
 
@@ -618,6 +893,7 @@ async fn reconcile_disk_and_doc(
     let team_path = Path::new(team_dir);
     let mut uploaded = 0usize;
     let mut downloaded = 0usize;
+    let mut secrets_changed = false;
 
     // 1. Collect local files
     let local_files = collect_files(team_path, team_path);
@@ -646,7 +922,10 @@ async fn reconcile_disk_and_doc(
             if let Ok(remote_content) = blobs_store.blobs().get_bytes(entry.content_hash()).await {
                 if is_tombstone(&remote_content) {
                     let file_path = team_path.join(&key);
-                    eprintln!("[P2P][reconcile] Remote tombstone -> deleting local: {}", key);
+                    eprintln!(
+                        "[P2P][reconcile] Remote tombstone -> deleting local: {}",
+                        key
+                    );
                     let _ = std::fs::remove_file(&file_path);
                     continue;
                 }
@@ -654,11 +933,32 @@ async fn reconcile_disk_and_doc(
             // Both exist — check if they differ
             let local_hash = iroh_blobs::Hash::new(&local_content);
             if local_hash != entry.content_hash() {
-                // Local wins: upload local version
-                if *role != MemberRole::Viewer {
-                    if key == "_team/members.json" && !is_owner && *role == MemberRole::Viewer {
-                        continue;
+                if *role == MemberRole::Viewer {
+                    continue;
+                }
+                if key == "_team/members.json" && !is_owner {
+                    continue;
+                }
+
+                // Check if local file was modified since last sync
+                let file_path = team_path.join(&key);
+                let local_was_edited = {
+                    let eng = engine.lock().await;
+                    if let Some(record) = eng.file_sync_records.get(&key) {
+                        // Compare file's current mtime against mtime at last sync
+                        match std::fs::metadata(&file_path).and_then(|m| m.modified()) {
+                            Ok(current_mtime) => current_mtime > record.local_mtime_at_sync,
+                            Err(_) => false,
+                        }
+                    } else {
+                        // No sync record → first reconcile after upgrade.
+                        // Conservative: owner wins for backwards compat, others defer to remote.
+                        is_owner
                     }
+                };
+
+                if local_was_edited {
+                    // Local was genuinely edited offline → local wins
                     let content = if local_content.is_empty() {
                         vec![b'\n']
                     } else {
@@ -667,8 +967,32 @@ async fn reconcile_disk_and_doc(
                     if let Err(e) = doc.set_bytes(author, key.clone(), content).await {
                         eprintln!("[P2P][reconcile] Failed to upload {}: {}", key, e);
                     } else {
-                        eprintln!("[P2P][reconcile] Conflict -> local wins: {}", key);
+                        eprintln!(
+                            "[P2P][reconcile] Conflict -> local wins (edited offline): {}",
+                            key
+                        );
                         uploaded += 1;
+                    }
+                } else {
+                    // Local is stale (not edited since last sync) → remote wins
+                    if let Ok(content) = blobs_store.blobs().get_bytes(entry.content_hash()).await {
+                        if !is_tombstone(&content) {
+                            if let Some(parent) = file_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if let Err(e) = std::fs::write(&file_path, &content) {
+                                eprintln!("[P2P][reconcile] Failed to write {}: {}", key, e);
+                            } else {
+                                eprintln!(
+                                    "[P2P][reconcile] Conflict -> remote wins (local stale): {}",
+                                    key
+                                );
+                                if key.starts_with("_secrets/") {
+                                    secrets_changed = true;
+                                }
+                                downloaded += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -685,9 +1009,23 @@ async fn reconcile_disk_and_doc(
                 if let Err(e) = std::fs::write(&file_path, &content) {
                     eprintln!("[P2P][reconcile] Failed to write {}: {}", key, e);
                 } else {
+                    if key.starts_with("_secrets/") {
+                        secrets_changed = true;
+                    }
                     downloaded += 1;
                 }
             }
+        }
+    }
+
+    if secrets_changed {
+        if let Some(app) = app_handle {
+            let shared_state = app.state::<crate::commands::shared_secrets::SharedSecretsState>();
+            if let Err(e) = crate::commands::shared_secrets::load_all_secrets(&shared_state) {
+                eprintln!("[P2P] Failed to reload shared secrets: {}", e);
+            }
+            use tauri::Emitter;
+            let _ = app.emit("secrets-changed", ());
         }
     }
 
@@ -757,14 +1095,23 @@ pub async fn rotate_namespace(
     node: &mut IrohNode,
     team_dir: &str,
     workspace_path: &str,
+    engine: SyncEngineState,
 ) -> Result<String, String> {
+    let previous_config = read_p2p_config(workspace_path)?.unwrap_or_default();
+    let previous_manifest = read_members_manifest(team_dir)?;
+    let previous_team_info =
+        std::fs::read(Path::new(team_dir).join("_team").join("team.json")).ok();
+
+    // Stop the old namespace's watchers before we reuse the same team dir.
+    node.bump_sync_generation();
+
     // Close existing doc
     if let Some(old_doc) = node.active_doc.take() {
         let _ = old_doc.leave().await;
     }
 
-    // Re-create as owner
-    create_team(
+    // Re-create as owner in a new namespace.
+    let ticket = create_team(
         node,
         team_dir,
         workspace_path,
@@ -775,8 +1122,68 @@ pub async fn rotate_namespace(
         None,
         None,
         None,
+        engine,
     )
-    .await
+    .await?;
+
+    let owner_node_id = previous_manifest
+        .as_ref()
+        .map(|manifest| manifest.owner_node_id.clone())
+        .or_else(|| previous_config.owner_node_id.clone())
+        .unwrap_or_else(|| get_node_id(node));
+    let restored_members = previous_manifest
+        .as_ref()
+        .map(|manifest| manifest.members.clone())
+        .unwrap_or_else(|| previous_config.allowed_members.clone());
+
+    if !restored_members.is_empty() {
+        write_members_manifest(team_dir, &owner_node_id, &restored_members)?;
+    }
+
+    if let Some(team_info_bytes) = previous_team_info {
+        let team_info_path = Path::new(team_dir).join("_team").join("team.json");
+        if let Some(parent) = team_info_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&team_info_path, &team_info_bytes)
+            .map_err(|e| format!("Failed to restore team.json after rotation: {}", e))?;
+    }
+
+    let mut new_config = read_p2p_config(workspace_path)?.unwrap_or_default();
+    new_config.tickets = previous_config.tickets;
+    new_config.publish_enabled = previous_config.publish_enabled;
+    new_config.last_sync_at = previous_config.last_sync_at;
+    new_config.owner_node_id = Some(owner_node_id.clone());
+    new_config.allowed_members = restored_members.clone();
+    new_config.role = previous_config.role.or(Some(MemberRole::Owner));
+    new_config.seed_url = previous_config.seed_url;
+    new_config.team_secret = previous_config.team_secret;
+    new_config.seed_iroh_node_id = previous_config.seed_iroh_node_id;
+    new_config.seed_iroh_relay_url = previous_config.seed_iroh_relay_url;
+    new_config.seed_iroh_addrs = previous_config.seed_iroh_addrs;
+    new_config.cached_peer_addrs = previous_config.cached_peer_addrs;
+    write_p2p_config(workspace_path, Some(&new_config))?;
+
+    if let Some(doc) = node.active_doc.as_ref() {
+        if !restored_members.is_empty() {
+            let manifest_bytes =
+                std::fs::read(Path::new(team_dir).join("_team").join("members.json"))
+                    .map_err(|e| format!("Failed to read restored members.json: {}", e))?;
+            doc.set_bytes(node.author, "_team/members.json", manifest_bytes)
+                .await
+                .map_err(|e| format!("Failed to sync restored members.json: {}", e))?;
+        }
+
+        if let Some(team_info_bytes) =
+            std::fs::read(Path::new(team_dir).join("_team").join("team.json")).ok()
+        {
+            doc.set_bytes(node.author, "_team/team.json", team_info_bytes)
+                .await
+                .map_err(|e| format!("Failed to sync restored team.json: {}", e))?;
+        }
+    }
+
+    Ok(ticket)
 }
 
 // ─── Background Sync Tasks ──────────────────────────────────────────────
@@ -945,13 +1352,202 @@ async fn collect_sync_peers(
     peers
 }
 
+/// Sync coordinator: handles NeighborUp/SyncFinished events and periodic fallback sync.
+/// Extracted from the inline Task C in start_sync_tasks for clarity and reuse.
+async fn run_sync_coordinator(
+    doc: iroh_docs::api::Doc,
+    endpoint: Endpoint,
+    team_dir: String,
+    doc_ticket: Option<String>,
+    seed_endpoint: Option<iroh::EndpointAddr>,
+    mut cached_addrs: HashMap<String, Vec<String>>,
+    workspace_path: Option<String>,
+    engine: Arc<Mutex<SyncEngine>>,
+    app_handle: Option<tauri::AppHandle>,
+) {
+    use futures_lite::StreamExt;
+    use iroh_docs::engine::LiveEvent;
+    let seed_ref = seed_endpoint.as_ref();
+
+    // Parse ticket peers (the owner's address for joiners).
+    let mut ticket_peers: Vec<iroh::EndpointAddr> = Vec::new();
+    if let Some(ref ticket_str) = doc_ticket {
+        if let Ok(ticket) = ticket_str.trim().parse::<iroh_docs::DocTicket>() {
+            ticket_peers = ticket.nodes;
+        }
+    }
+
+    let ep = endpoint;
+
+    // Do an initial sync shortly after startup
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    {
+        let peers =
+            collect_sync_peers(&ep, &ticket_peers, &team_dir, seed_ref, &cached_addrs).await;
+        if !peers.is_empty() {
+            if let Err(e) = doc.start_sync(peers.clone()).await {
+                eprintln!("[P2P][sync] Initial sync failed: {}", e);
+            } else {
+                eprintln!(
+                    "[P2P][sync] Initial sync triggered with {} peers",
+                    peers.len()
+                );
+            }
+        }
+    }
+
+    // Subscribe to doc events for NeighborUp
+    let mut events = match doc.subscribe().await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[P2P][sync] Failed to subscribe for sync events: {}", e);
+            return;
+        }
+    };
+
+    // Fallback timer: sync every 5 minutes
+    let mut fallback = tokio::time::interval(std::time::Duration::from_secs(300));
+    fallback.tick().await; // skip first immediate tick
+
+    loop {
+        tokio::select! {
+            event = events.next() => {
+                match event {
+                    Some(Ok(LiveEvent::NeighborUp(peer_key))) => {
+                        // New peer appeared in gossip — trigger sync with them
+                        let peer_id: iroh::EndpointId = peer_key;
+                        let peer_id_str = peer_id.to_string();
+                        eprintln!("[P2P][sync] NeighborUp: {}", &peer_id_str[..10]);
+                        engine.lock().await.record_neighbor_up(&peer_id_str);
+                        emit_engine_state(&app_handle, &engine).await;
+                        if let Some(info) = ep.remote_info(peer_id).await {
+                            let mut addrs = std::collections::BTreeSet::new();
+                            for addr_info in info.addrs() {
+                                addrs.insert(addr_info.addr().clone());
+                            }
+                            if !addrs.is_empty() {
+                                let peer_addr = iroh::EndpointAddr { id: peer_id, addrs };
+                                let _ = doc.start_sync(vec![peer_addr]).await;
+                            }
+                        }
+                    }
+                    Some(Ok(LiveEvent::SyncFinished(ev))) => {
+                        let peer_id_str = ev.peer.to_string();
+                        if let Ok(details) = &ev.result {
+                            if details.entries_received > 0 || details.entries_sent > 0 {
+                                eprintln!(
+                                    "[P2P][sync] SyncFinished peer={} sent={} recv={}",
+                                    &peer_id_str[..10],
+                                    details.entries_sent,
+                                    details.entries_received
+                                );
+                            }
+                            engine.lock().await.record_sync_finished(
+                                &peer_id_str,
+                                details.entries_sent as u64,
+                                details.entries_received as u64,
+                            );
+                            emit_engine_state(&app_handle, &engine).await;
+                        }
+                        // Cache the peer's address for future LAN reconnection
+                        let peer_id: iroh::EndpointId = ev.peer;
+                        if let Some(info) = ep.remote_info(peer_id).await {
+                            let addrs: Vec<String> = info.addrs()
+                                .filter_map(|a| match a.addr() {
+                                    iroh::TransportAddr::Ip(sock) => Some(sock.to_string()),
+                                    _ => None, // skip relay addrs
+                                })
+                                .collect();
+                            if !addrs.is_empty() {
+                                cached_addrs.insert(peer_id.to_string(), addrs);
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("closed") || err_str.contains("shutdown") {
+                            eprintln!("[P2P][sync] Event stream closed (fatal): {}", e);
+                            break;
+                        }
+                        // Transient error — keep listening
+                        eprintln!("[P2P][sync] Event stream error (transient): {}", e);
+                    }
+                    None => {
+                        // Stream ended — fatal
+                        eprintln!("[P2P][sync] Event stream ended");
+                        break;
+                    }
+                    _ => {} // Ignore other events
+                }
+            }
+            _ = fallback.tick() => {
+                // Fallback: sync with all known peers every 5 minutes
+                let peers = collect_sync_peers(&ep, &ticket_peers, &team_dir, seed_ref, &cached_addrs).await;
+                if !peers.is_empty() {
+                    // Update cache from collected peers (IP addrs only)
+                    for peer in &peers {
+                        let addrs: Vec<String> = peer.addrs.iter()
+                            .filter_map(|a| match a {
+                                iroh::TransportAddr::Ip(sock) => Some(sock.to_string()),
+                                _ => None,
+                            })
+                            .collect();
+                        if !addrs.is_empty() {
+                            cached_addrs.insert(peer.id.to_string(), addrs);
+                        }
+                    }
+                    // Refresh ticket with a few known peers so new joiners
+                    // can connect to ANY online member, not just the owner.
+                    // Cap at 5 peers to keep the ticket string small.
+                    if let Some(ref ws) = workspace_path {
+                        if let Ok(fresh_ticket) = doc.share(
+                            iroh_docs::api::protocol::ShareMode::Write,
+                            iroh_docs::api::protocol::AddrInfoOptions::RelayAndAddresses,
+                        ).await {
+                            let mut enriched = fresh_ticket;
+                            for peer in &peers {
+                                if enriched.nodes.len() >= 5 {
+                                    break;
+                                }
+                                if !enriched.nodes.iter().any(|n| n.id == peer.id) {
+                                    enriched.nodes.push(peer.clone());
+                                }
+                            }
+                            if let Ok(Some(mut cfg)) = read_p2p_config(ws) {
+                                cfg.doc_ticket = Some(enriched.to_string());
+                                cfg.cached_peer_addrs = cached_addrs.clone();
+                                let _ = write_p2p_config(ws, Some(&cfg));
+                            }
+                        } else {
+                            // Ticket refresh failed — still persist cached addrs
+                            if let Ok(Some(mut cfg)) = read_p2p_config(ws) {
+                                cfg.cached_peer_addrs = cached_addrs.clone();
+                                let _ = write_p2p_config(ws, Some(&cfg));
+                            }
+                        }
+                    }
+                    match doc.start_sync(peers.clone()).await {
+                        Ok(()) => eprintln!(
+                            "[P2P][sync] Fallback sync with {} peers",
+                            peers.len()
+                        ),
+                        Err(e) => eprintln!("[P2P][sync] Fallback sync failed: {}", e),
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Start background tasks for bidirectional sync between doc and filesystem.
+/// Wraps all 3 sync tasks (doc→disk, disk→doc, sync coordinator) in a supervisor
+/// loop that restarts them all if any one exits.
 fn start_sync_tasks(
     doc: &iroh_docs::api::Doc,
     author: iroh_docs::AuthorId,
     store: &FsStore,
     team_dir: &str,
-    suppressed_paths: Arc<Mutex<HashSet<std::path::PathBuf>>>,
+    suppressed_paths: Arc<Mutex<HashMap<std::path::PathBuf, Instant>>>,
     my_role: Arc<Mutex<MemberRole>>,
     my_node_id: String,
     owner_node_id: Option<String>,
@@ -961,222 +1557,231 @@ fn start_sync_tasks(
     seed_endpoint: Option<iroh::EndpointAddr>,
     cached_peer_addrs: HashMap<String, Vec<String>>,
     workspace_path: Option<String>,
+    engine: Arc<Mutex<SyncEngine>>,
+    mut generation_rx: tokio::sync::watch::Receiver<u64>,
+    my_generation: u64,
+    manifest_lock: Arc<RwLock<()>>,
 ) {
-    let blobs_store: iroh_blobs::api::Store = store.clone().into();
-    let team_dir_a = team_dir.to_string();
-    let doc_a = doc.clone();
-    let suppressed_a = suppressed_paths.clone();
+    let doc = doc.clone();
+    let store = store.clone();
+    let team_dir = team_dir.to_string();
 
-    // Task A: remote doc changes → disk
-    let my_node_id_a = my_node_id.clone();
-    let owner_node_id_a = owner_node_id.clone();
     tokio::spawn(async move {
-        doc_to_disk_watcher(
-            doc_a,
-            blobs_store,
-            team_dir_a,
-            suppressed_a,
-            my_node_id_a,
-            owner_node_id_a,
-            app_handle,
-        )
-        .await;
-    });
-
-    // Task B: local disk changes → doc (with blob store for skills counting)
-    let doc_b = doc.clone();
-    let blobs_store_b: iroh_blobs::api::Store = store.clone().into();
-    let team_dir_b = team_dir.to_string();
-    let suppressed_b = suppressed_paths;
-    tokio::spawn(async move {
-        disk_to_doc_watcher(
-            doc_b,
-            blobs_store_b,
-            author,
-            team_dir_b,
-            suppressed_b,
-            my_role,
-            my_node_id,
-            owner_node_id,
-        )
-        .await;
-    });
-
-    // Task C: event-driven + fallback periodic sync.
-    // Listens for NeighborUp/SyncFinished events to register new peers with gossip,
-    // and falls back to a periodic sync every 5 minutes for resilience.
-    let doc_c = doc.clone();
-    let _doc_c2 = doc.clone();
-    let team_dir_c = team_dir.to_string();
-    let seed_ep = seed_endpoint;
-    let mut cached_addrs = cached_peer_addrs;
-    let ws_path = workspace_path;
-    tokio::spawn(async move {
-        use futures_lite::StreamExt;
-        use iroh_docs::engine::LiveEvent;
-        let seed_ref = seed_ep.as_ref();
-
-        // Parse ticket peers (the owner's address for joiners).
-        let mut ticket_peers: Vec<iroh::EndpointAddr> = Vec::new();
-        if let Some(ref ticket_str) = doc_ticket {
-            if let Ok(ticket) = ticket_str.trim().parse::<iroh_docs::DocTicket>() {
-                ticket_peers = ticket.nodes;
-            }
-        }
-
-        let ep = endpoint;
-
-        // Do an initial sync shortly after startup
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // Initialize engine
         {
-            let peers =
-                collect_sync_peers(&ep, &ticket_peers, &team_dir_c, seed_ref, &cached_addrs).await;
-            if !peers.is_empty() {
-                if let Err(e) = doc_c.start_sync(peers.clone()).await {
-                    eprintln!("[P2P][sync] Initial sync failed: {}", e);
-                } else {
-                    eprintln!(
-                        "[P2P][sync] Initial sync triggered with {} peers",
-                        peers.len()
-                    );
-                }
+            let mut eng = engine.lock().await;
+            eng.status = EngineStatus::Connected;
+            eng.started_at = Instant::now();
+            if let Err(e) = eng.load_peers_from_manifest(&team_dir) {
+                eprintln!("[P2P][engine] Failed to load peers from manifest: {}", e);
             }
         }
+        emit_engine_state(&app_handle, &engine).await;
 
-        // Subscribe to doc events for NeighborUp
-        let mut events = match doc_c.subscribe().await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[P2P][sync] Failed to subscribe for sync events: {}", e);
-                return;
-            }
-        };
-
-        // Fallback timer: sync every 5 minutes
-        let mut fallback = tokio::time::interval(std::time::Duration::from_secs(300));
-        fallback.tick().await; // skip first immediate tick
+        let mut restart_count: u32 = 0;
 
         loop {
-            tokio::select! {
-                event = events.next() => {
-                    match event {
-                        Some(Ok(LiveEvent::NeighborUp(peer_key))) => {
-                            // New peer appeared in gossip — trigger sync with them
-                            let peer_id: iroh::EndpointId = peer_key;
-                            eprintln!("[P2P][sync] NeighborUp: {}", &peer_id.to_string()[..10]);
-                            if let Some(info) = ep.remote_info(peer_id).await {
-                                let mut addrs = std::collections::BTreeSet::new();
-                                for addr_info in info.addrs() {
-                                    addrs.insert(addr_info.addr().clone());
-                                }
-                                if !addrs.is_empty() {
-                                    let peer_addr = iroh::EndpointAddr { id: peer_id, addrs };
-                                    let _ = doc_c.start_sync(vec![peer_addr]).await;
-                                }
-                            }
-                        }
-                        Some(Ok(LiveEvent::SyncFinished(ev))) => {
-                            if let Ok(details) = &ev.result {
-                                if details.entries_received > 0 || details.entries_sent > 0 {
-                                    eprintln!(
-                                        "[P2P][sync] SyncFinished peer={} sent={} recv={}",
-                                        &ev.peer.to_string()[..10],
-                                        details.entries_sent,
-                                        details.entries_received
-                                    );
-                                }
-                            }
-                            // Cache the peer's address for future LAN reconnection
-                            let peer_id: iroh::EndpointId = ev.peer;
-                            if let Some(info) = ep.remote_info(peer_id).await {
-                                let addrs: Vec<String> = info.addrs()
-                                    .filter_map(|a| match a.addr() {
-                                        iroh::TransportAddr::Ip(sock) => Some(sock.to_string()),
-                                        _ => None, // skip relay addrs
-                                    })
-                                    .collect();
-                                if !addrs.is_empty() {
-                                    cached_addrs.insert(peer_id.to_string(), addrs);
-                                }
-                            }
-                        }
-                        Some(Err(_)) | None => {
-                            // Stream ended or error — break out
-                            eprintln!("[P2P][sync] Event stream ended");
-                            break;
-                        }
-                        _ => {} // Ignore other events
-                    }
+            // Check if this sync generation is still current
+            if *generation_rx.borrow() != my_generation {
+                eprintln!(
+                    "[P2P][engine] Generation {} is stale (current={}), exiting supervisor",
+                    my_generation,
+                    *generation_rx.borrow()
+                );
+                let mut eng = engine.lock().await;
+                eng.stream_health = StreamHealth::Dead;
+                break;
+            }
+
+            // Mark stream health
+            {
+                let mut eng = engine.lock().await;
+                eng.stream_health = if restart_count == 0 {
+                    StreamHealth::Healthy
+                } else {
+                    StreamHealth::Restarting
+                };
+                eng.restart_count = restart_count;
+            }
+            emit_engine_state(&app_handle, &engine).await;
+
+            let blobs_store: iroh_blobs::api::Store = store.clone().into();
+
+            // Spawn Task A: doc → disk
+            let doc_a = doc.clone();
+            let blobs_a = blobs_store.clone();
+            let team_dir_a = team_dir.clone();
+            let suppressed_a = suppressed_paths.clone();
+            let my_node_id_a = my_node_id.clone();
+            let owner_node_id_a = owner_node_id.clone();
+            let app_handle_a = app_handle.clone();
+            let engine_a = engine.clone();
+            let manifest_lock_a = manifest_lock.clone();
+            let task_a = tokio::spawn(async move {
+                doc_to_disk_watcher(
+                    doc_a,
+                    blobs_a,
+                    team_dir_a,
+                    suppressed_a,
+                    my_node_id_a,
+                    owner_node_id_a,
+                    app_handle_a,
+                    engine_a,
+                    manifest_lock_a,
+                )
+                .await;
+                "doc_to_disk"
+            });
+
+            // Spawn Task B: disk → doc
+            let doc_b = doc.clone();
+            let blobs_b: iroh_blobs::api::Store = store.clone().into();
+            let team_dir_b = team_dir.clone();
+            let suppressed_b = suppressed_paths.clone();
+            let my_role_b = my_role.clone();
+            let my_node_id_b = my_node_id.clone();
+            let owner_node_id_b = owner_node_id.clone();
+            let engine_b = engine.clone();
+            let manifest_lock_b = manifest_lock.clone();
+            let task_b = tokio::spawn(async move {
+                disk_to_doc_watcher(
+                    doc_b,
+                    blobs_b,
+                    author,
+                    team_dir_b,
+                    suppressed_b,
+                    my_role_b,
+                    my_node_id_b,
+                    owner_node_id_b,
+                    engine_b,
+                    manifest_lock_b,
+                )
+                .await;
+                "disk_to_doc"
+            });
+
+            // Spawn Task C: sync coordinator (NeighborUp + fallback)
+            let doc_c = doc.clone();
+            let team_dir_c = team_dir.clone();
+            let ep_c = endpoint.clone();
+            let doc_ticket_c = doc_ticket.clone();
+            let seed_ep_c = seed_endpoint.clone();
+            let cached_addrs_c = cached_peer_addrs.clone();
+            let ws_path_c = workspace_path.clone();
+            let engine_c = engine.clone();
+            let app_handle_c = app_handle.clone();
+            let task_c = tokio::spawn(async move {
+                run_sync_coordinator(
+                    doc_c,
+                    ep_c,
+                    team_dir_c,
+                    doc_ticket_c,
+                    seed_ep_c,
+                    cached_addrs_c,
+                    ws_path_c,
+                    engine_c,
+                    app_handle_c,
+                )
+                .await;
+                "sync_coordinator"
+            });
+
+            // Grab abort handles before select! moves the JoinHandles
+            let abort_a = task_a.abort_handle();
+            let abort_b = task_b.abort_handle();
+            let abort_c = task_c.abort_handle();
+
+            // Wait for ANY task to exit
+            let (which, generation_changed) = tokio::select! {
+                result = task_a => (result.unwrap_or("doc_to_disk (panic)"), false),
+                result = task_b => (result.unwrap_or("disk_to_doc (panic)"), false),
+                result = task_c => (result.unwrap_or("sync_coordinator (panic)"), false),
+                changed = generation_rx.changed() => {
+                    let label = if changed.is_ok() {
+                        "generation_changed"
+                    } else {
+                        "generation_closed"
+                    };
+                    (label, true)
                 }
-                _ = fallback.tick() => {
-                    // Fallback: sync with all known peers every 5 minutes
-                    let peers = collect_sync_peers(&ep, &ticket_peers, &team_dir_c, seed_ref, &cached_addrs).await;
-                    if !peers.is_empty() {
-                        // Update cache from collected peers (IP addrs only)
-                        for peer in &peers {
-                            let addrs: Vec<String> = peer.addrs.iter()
-                                .filter_map(|a| match a {
-                                    iroh::TransportAddr::Ip(sock) => Some(sock.to_string()),
-                                    _ => None,
-                                })
-                                .collect();
-                            if !addrs.is_empty() {
-                                cached_addrs.insert(peer.id.to_string(), addrs);
-                            }
-                        }
-                        // Refresh ticket with a few known peers so new joiners
-                        // can connect to ANY online member, not just the owner.
-                        // Cap at 5 peers to keep the ticket string small.
-                        if let Some(ref ws) = ws_path {
-                            if let Ok(fresh_ticket) = doc_c.share(
-                                iroh_docs::api::protocol::ShareMode::Write,
-                                iroh_docs::api::protocol::AddrInfoOptions::RelayAndAddresses,
-                            ).await {
-                                let mut enriched = fresh_ticket;
-                                for peer in &peers {
-                                    if enriched.nodes.len() >= 5 {
-                                        break;
-                                    }
-                                    if !enriched.nodes.iter().any(|n| n.id == peer.id) {
-                                        enriched.nodes.push(peer.clone());
-                                    }
-                                }
-                                if let Ok(Some(mut cfg)) = read_p2p_config(ws) {
-                                    cfg.doc_ticket = Some(enriched.to_string());
-                                    cfg.cached_peer_addrs = cached_addrs.clone();
-                                    let _ = write_p2p_config(ws, Some(&cfg));
-                                }
-                            } else {
-                                // Ticket refresh failed — still persist cached addrs
-                                if let Ok(Some(mut cfg)) = read_p2p_config(ws) {
-                                    cfg.cached_peer_addrs = cached_addrs.clone();
-                                    let _ = write_p2p_config(ws, Some(&cfg));
-                                }
-                            }
-                        }
-                        match doc_c.start_sync(peers.clone()).await {
-                            Ok(()) => eprintln!(
-                                "[P2P][sync] Fallback sync with {} peers",
-                                peers.len()
-                            ),
-                            Err(e) => eprintln!("[P2P][sync] Fallback sync failed: {}", e),
-                        }
-                    }
+            };
+
+            // One task died — abort the others
+            abort_a.abort();
+            abort_b.abort();
+            abort_c.abort();
+
+            if generation_changed || *generation_rx.borrow() != my_generation {
+                eprintln!(
+                    "[P2P][engine] Generation {} changed while '{}' was running, exiting supervisor",
+                    my_generation, which
+                );
+                let mut eng = engine.lock().await;
+                eng.stream_health = StreamHealth::Dead;
+                break;
+            }
+
+            restart_count += 1;
+            eprintln!(
+                "[P2P][engine] Task '{}' exited — restarting all in 3s (restart #{})",
+                which, restart_count
+            );
+
+            {
+                let mut eng = engine.lock().await;
+                eng.stream_health = StreamHealth::Dead;
+                eng.restart_count = restart_count;
+            }
+            emit_engine_state(&app_handle, &engine).await;
+
+            // Wait 3s before restart, but exit immediately if generation changes
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                _ = generation_rx.changed() => {
+                    eprintln!(
+                        "[P2P][engine] Generation changed during restart sleep, exiting supervisor"
+                    );
+                    let mut eng = engine.lock().await;
+                    eng.stream_health = StreamHealth::Dead;
+                    break;
                 }
             }
+
+            // Mark as restarting before re-entering loop
+            {
+                let mut eng = engine.lock().await;
+                eng.stream_health = StreamHealth::Restarting;
+            }
+            emit_engine_state(&app_handle, &engine).await;
+        }
+
+        // Clean up suppressed paths on exit
+        {
+            let mut suppressed = suppressed_paths.lock().await;
+            suppressed.clear();
+            eprintln!("[P2P][engine] Cleared suppressed paths on supervisor exit");
         }
     });
+}
+
+/// Emit the current engine snapshot to the frontend via Tauri event.
+async fn emit_engine_state(app_handle: &Option<tauri::AppHandle>, engine: &Arc<Mutex<SyncEngine>>) {
+    if let Some(ref app) = app_handle {
+        use tauri::Emitter;
+        let snapshot = engine.lock().await.snapshot();
+        let _ = app.emit("p2p:engine-state", &snapshot);
+    }
 }
 
 /// Write content to a file path while suppressing fs watcher feedback.
 async fn write_and_suppress(
     file_path: &std::path::Path,
     content: &[u8],
-    suppressed_paths: &Arc<Mutex<HashSet<std::path::PathBuf>>>,
+    suppressed_paths: &Arc<Mutex<HashMap<std::path::PathBuf, Instant>>>,
 ) {
     {
         let mut suppressed = suppressed_paths.lock().await;
-        suppressed.insert(file_path.to_path_buf());
+        suppressed.insert(file_path.to_path_buf(), Instant::now());
     }
 
     if let Some(parent) = file_path.parent() {
@@ -1201,10 +1806,12 @@ async fn doc_to_disk_watcher(
     doc: iroh_docs::api::Doc,
     blobs_store: iroh_blobs::api::Store,
     team_dir: String,
-    suppressed_paths: Arc<Mutex<HashSet<std::path::PathBuf>>>,
+    suppressed_paths: Arc<Mutex<HashMap<std::path::PathBuf, Instant>>>,
     my_node_id: String,
     owner_node_id: Option<String>,
     app_handle: Option<tauri::AppHandle>,
+    engine: Arc<Mutex<SyncEngine>>,
+    manifest_lock: Arc<RwLock<()>>,
 ) {
     use futures_lite::StreamExt;
     use iroh_docs::engine::LiveEvent;
@@ -1241,9 +1848,12 @@ async fn doc_to_disk_watcher(
     }
 
     // Pre-load role map from _team/members.json
-    if let Ok(Some(manifest)) = read_members_manifest(&team_dir) {
-        for member in &manifest.members {
-            node_to_role.insert(member.node_id.clone(), member.role.clone());
+    {
+        let _guard = manifest_lock.read().await;
+        if let Ok(Some(manifest)) = read_members_manifest(&team_dir) {
+            for member in &manifest.members {
+                node_to_role.insert(member.node_id.clone(), member.role.clone());
+            }
         }
     }
 
@@ -1251,11 +1861,29 @@ async fn doc_to_disk_watcher(
     // When ContentReady fires we do an O(1) lookup instead of scanning all entries.
     let mut pending_content: HashMap<iroh_blobs::Hash, (String, String)> = HashMap::new();
 
+    let mut consecutive_errors: u32 = 0;
+
     while let Some(event_result) = events.next().await {
         let event = match event_result {
-            Ok(e) => e,
+            Ok(e) => {
+                consecutive_errors = 0;
+                e
+            }
             Err(e) => {
-                eprintln!("[P2P][doc→disk] Event stream error: {}", e);
+                consecutive_errors += 1;
+                let err_str = e.to_string();
+                // Treat repeated errors or "closed" errors as fatal — let supervisor restart
+                if consecutive_errors >= 3
+                    || err_str.contains("closed")
+                    || err_str.contains("shutdown")
+                {
+                    eprintln!(
+                        "[P2P][doc→disk] Fatal event stream error (count={}): {}",
+                        consecutive_errors, e
+                    );
+                    break;
+                }
+                eprintln!("[P2P][doc→disk] Transient event stream error: {}", e);
                 continue;
             }
         };
@@ -1278,10 +1906,8 @@ async fn doc_to_disk_watcher(
 
                 if content_status != iroh_docs::ContentStatus::Complete {
                     // Content not yet downloaded — remember it for ContentReady
-                    pending_content.insert(
-                        entry.content_hash(),
-                        (key.clone(), author_id_str.clone()),
-                    );
+                    pending_content
+                        .insert(entry.content_hash(), (key.clone(), author_id_str.clone()));
                     eprintln!(
                         "[P2P][doc→disk] Queued for ContentReady: {} (pending={})",
                         key,
@@ -1354,11 +1980,16 @@ async fn doc_to_disk_watcher(
                                     leaving_node_id
                                 );
                                 // Refresh role cache
-                                if let Ok(Some(manifest)) = read_members_manifest(&team_dir) {
-                                    node_to_role.clear();
-                                    for member in &manifest.members {
-                                        node_to_role
-                                            .insert(member.node_id.clone(), member.role.clone());
+                                {
+                                    let _guard = manifest_lock.read().await;
+                                    if let Ok(Some(manifest)) = read_members_manifest(&team_dir) {
+                                        node_to_role.clear();
+                                        for member in &manifest.members {
+                                            node_to_role.insert(
+                                                member.node_id.clone(),
+                                                member.role.clone(),
+                                            );
+                                        }
                                     }
                                 }
                                 // Emit Tauri event so the owner's UI can show a notification
@@ -1413,7 +2044,10 @@ async fn doc_to_disk_watcher(
                     let is_privileged_write = match (&writer_node_id, &owner_node_id) {
                         (Some(writer), Some(owner)) if writer == owner => true,
                         (None, _) if author_to_node.is_empty() => true, // bootstrap: no authors known yet
-                        _ => matches!(writer_role, Some(MemberRole::Owner) | Some(MemberRole::Editor)),
+                        _ => matches!(
+                            writer_role,
+                            Some(MemberRole::Owner) | Some(MemberRole::Editor)
+                        ),
                     };
                     if !is_privileged_write {
                         eprintln!(
@@ -1427,7 +2061,11 @@ async fn doc_to_disk_watcher(
                         let file_path = Path::new(&team_dir).join(&key);
                         write_and_suppress(&file_path, &content, &suppressed_paths).await;
                         // Refresh role cache
-                        if let Ok(Some(manifest)) = read_members_manifest(&team_dir) {
+                        let manifest_opt = {
+                            let _guard = manifest_lock.read().await;
+                            read_members_manifest(&team_dir).ok().flatten()
+                        };
+                        if let Some(manifest) = manifest_opt {
                             node_to_role.clear();
                             for member in &manifest.members {
                                 node_to_role.insert(member.node_id.clone(), member.role.clone());
@@ -1516,6 +2154,21 @@ async fn doc_to_disk_watcher(
                     } else {
                         eprintln!("[P2P][doc→disk] Writing: {} ({} bytes)", key, content.len());
                         write_and_suppress(&file_path, &content, &suppressed_paths).await;
+                        // Record file sync timestamp
+                        if let Ok(mtime) = std::fs::metadata(&file_path).and_then(|m| m.modified())
+                        {
+                            engine.lock().await.record_file_synced(key.clone(), mtime);
+                        }
+                        if key.starts_with("_secrets/") {
+                            if let Some(ref app) = app_handle {
+                                let shared_state = app.state::<crate::commands::shared_secrets::SharedSecretsState>();
+                                if let Err(e) = crate::commands::shared_secrets::load_all_secrets(&shared_state) {
+                                    eprintln!("[P2P] Failed to reload shared secrets: {}", e);
+                                }
+                                use tauri::Emitter;
+                                let _ = app.emit("secrets-changed", ());
+                            }
+                        }
                     }
                 } else {
                     eprintln!("[P2P][doc→disk] Failed to get blob for: {}", key);
@@ -1560,12 +2213,15 @@ async fn doc_to_disk_watcher(
                 // Validate _team/members.json: only accept from owner or editor
                 if key == "_team/members.json" {
                     let writer_node = author_to_node.get(&author_id_str);
-                    let writer_role = writer_node
-                        .and_then(|w| node_to_role.get(w.as_str()).cloned());
+                    let writer_role =
+                        writer_node.and_then(|w| node_to_role.get(w.as_str()).cloned());
                     let is_privileged_write = match (writer_node, &owner_node_id) {
                         (Some(writer), Some(owner)) if writer == owner => true,
                         (None, _) if author_to_node.is_empty() => true, // bootstrap
-                        _ => matches!(writer_role, Some(MemberRole::Owner) | Some(MemberRole::Editor)),
+                        _ => matches!(
+                            writer_role,
+                            Some(MemberRole::Owner) | Some(MemberRole::Editor)
+                        ),
                     };
                     if !is_privileged_write {
                         eprintln!(
@@ -1578,16 +2234,18 @@ async fn doc_to_disk_watcher(
                     if let Ok(content) = blobs_store.blobs().get_bytes(hash).await {
                         let file_path = Path::new(&team_dir).join(&key);
                         write_and_suppress(&file_path, &content, &suppressed_paths).await;
-                        if let Ok(Some(manifest)) = read_members_manifest(&team_dir) {
-                            node_to_role.clear();
-                            for member in &manifest.members {
-                                node_to_role
-                                    .insert(member.node_id.clone(), member.role.clone());
-                            }
-                            if let Some(ref app) = app_handle {
-                                use tauri::Emitter;
-                                let _ =
-                                    app.emit("team:members-changed", serde_json::json!({}));
+                        {
+                            let _guard = manifest_lock.read().await;
+                            if let Ok(Some(manifest)) = read_members_manifest(&team_dir) {
+                                node_to_role.clear();
+                                for member in &manifest.members {
+                                    node_to_role
+                                        .insert(member.node_id.clone(), member.role.clone());
+                                }
+                                if let Some(ref app) = app_handle {
+                                    use tauri::Emitter;
+                                    let _ = app.emit("team:members-changed", serde_json::json!({}));
+                                }
                             }
                         }
                     }
@@ -1607,10 +2265,7 @@ async fn doc_to_disk_watcher(
                         continue;
                     }
                 } else if !author_to_node.is_empty() {
-                    eprintln!(
-                        "[P2P] Rejected ContentReady from unknown author: {}",
-                        key
-                    );
+                    eprintln!("[P2P] Rejected ContentReady from unknown author: {}", key);
                     continue;
                 }
 
@@ -1620,8 +2275,27 @@ async fn doc_to_disk_watcher(
                         eprintln!("[P2P][ContentReady] Deleting (tombstone): {}", key);
                         let _ = std::fs::remove_file(&file_path);
                     } else {
-                        eprintln!("[P2P][ContentReady] Writing: {} ({} bytes)", key, content.len());
+                        eprintln!(
+                            "[P2P][ContentReady] Writing: {} ({} bytes)",
+                            key,
+                            content.len()
+                        );
                         write_and_suppress(&file_path, &content, &suppressed_paths).await;
+                        // Record file sync timestamp
+                        if let Ok(mtime) = std::fs::metadata(&file_path).and_then(|m| m.modified())
+                        {
+                            engine.lock().await.record_file_synced(key.clone(), mtime);
+                        }
+                        if key.starts_with("_secrets/") {
+                            if let Some(ref app) = app_handle {
+                                let shared_state = app.state::<crate::commands::shared_secrets::SharedSecretsState>();
+                                if let Err(e) = crate::commands::shared_secrets::load_all_secrets(&shared_state) {
+                                    eprintln!("[P2P] Failed to reload shared secrets: {}", e);
+                                }
+                                use tauri::Emitter;
+                                let _ = app.emit("secrets-changed", ());
+                            }
+                        }
                     }
                 }
             }
@@ -1640,10 +2314,12 @@ async fn disk_to_doc_watcher(
     blobs_store: iroh_blobs::api::Store,
     author: iroh_docs::AuthorId,
     team_dir: String,
-    suppressed_paths: Arc<Mutex<HashSet<std::path::PathBuf>>>,
+    suppressed_paths: Arc<Mutex<HashMap<std::path::PathBuf, Instant>>>,
     my_role: Arc<Mutex<MemberRole>>,
     my_node_id: String,
     owner_node_id: Option<String>,
+    engine: Arc<Mutex<SyncEngine>>,
+    manifest_lock: Arc<RwLock<()>>,
 ) {
     use notify::{RecursiveMode, Watcher};
 
@@ -1689,9 +2365,17 @@ async fn disk_to_doc_watcher(
                     for path in &event.paths {
                         // Skip suppressed paths (written by remote sync)
                         {
-                            let suppressed = suppressed_paths.lock().await;
-                            if suppressed.contains(path) {
-                                continue;
+                            let mut suppressed = suppressed_paths.lock().await;
+                            if let Some(inserted_at) = suppressed.get(path) {
+                                if inserted_at.elapsed().as_secs() < 10 {
+                                    continue;
+                                }
+                                // Stale entry (>10s) — cleanup task likely failed, remove it
+                                suppressed.remove(path);
+                                eprintln!(
+                                    "[P2P] Removed stale suppressed path: {}",
+                                    path.display()
+                                );
                             }
                         }
 
@@ -1704,6 +2388,7 @@ async fn disk_to_doc_watcher(
 
                             // Refresh my_role if the members manifest changed
                             if rel_path == "_team/members.json" {
+                                let _guard = manifest_lock.read().await;
                                 if let Ok(Some(manifest)) = read_members_manifest(&team_dir) {
                                     if let Some(me) =
                                         manifest.members.iter().find(|m| m.node_id == my_node_id)
@@ -1754,6 +2439,13 @@ async fn disk_to_doc_watcher(
                                 );
                                 if let Err(e) = doc.set_bytes(author, key.clone(), content).await {
                                     eprintln!("[P2P] Failed to sync local change '{}': {}", key, e);
+                                } else {
+                                    // Record file sync timestamp
+                                    if let Ok(mtime) =
+                                        std::fs::metadata(path).and_then(|m| m.modified())
+                                    {
+                                        engine.lock().await.record_file_synced(key.clone(), mtime);
+                                    }
                                 }
                                 // Track skill file contributions for leaderboard
                                 if path
@@ -1783,7 +2475,10 @@ async fn disk_to_doc_watcher(
                             let key = rel_path;
                             // Write tombstone marker (iroh rejects empty blobs)
                             eprintln!("[P2P][disk→doc] Deleting (tombstone): {}", key);
-                            if let Err(e) = doc.set_bytes(author, key.clone(), TOMBSTONE_MARKER.to_vec()).await {
+                            if let Err(e) = doc
+                                .set_bytes(author, key.clone(), TOMBSTONE_MARKER.to_vec())
+                                .await
+                            {
                                 eprintln!("[P2P] Failed to write tombstone for '{}': {}", key, e);
                             }
                         }
@@ -2005,24 +2700,12 @@ pub fn read_members_manifest(team_dir: &str) -> Result<Option<TeamManifest>, Str
 
 // ─── Leave Team (member) ─────────────────────────────────────────────────
 
-/// Leave the team as a non-owner member.
-/// Writes a leave tombstone to the P2P doc so the owner is notified,
-/// then disconnects and removes all local team data.
-#[tauri::command]
-pub async fn p2p_leave_team(
-    iroh_state: tauri::State<'_, IrohState>,
-    opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
+async fn leave_team_for_workspace(
+    iroh_state: &IrohState,
+    workspace_path: &str,
 ) -> Result<(), String> {
-    let workspace_path = opencode_state
-        .inner
-        .lock()
-        .map_err(|e| e.to_string())?
-        .workspace_path
-        .clone()
-        .ok_or("No workspace path set")?;
-
     // Owner must use p2p_dissolve_team instead
-    let config = read_p2p_config(&workspace_path)?.unwrap_or_default();
+    let config = read_p2p_config(workspace_path)?.unwrap_or_default();
     if config.role == Some(MemberRole::Owner) {
         return Err("Team owners cannot leave — use Dissolve Team to end the team".to_string());
     }
@@ -2049,15 +2732,16 @@ pub async fn p2p_leave_team(
     }
     drop(guard);
 
-    clear_p2p_and_team_dir(&workspace_path)?;
+    clear_p2p_and_team_dir(workspace_path)?;
 
     Ok(())
 }
 
-// ─── Disconnect ─────────────────────────────────────────────────────────
-
+/// Leave the team as a non-owner member.
+/// Writes a leave tombstone to the P2P doc so the owner is notified,
+/// then disconnects and removes all local team data.
 #[tauri::command]
-pub async fn p2p_disconnect_source(
+pub async fn p2p_leave_team(
     iroh_state: tauri::State<'_, IrohState>,
     opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
 ) -> Result<(), String> {
@@ -2068,9 +2752,17 @@ pub async fn p2p_disconnect_source(
         .workspace_path
         .clone()
         .ok_or("No workspace path set")?;
+    leave_team_for_workspace(iroh_state.inner(), &workspace_path).await
+}
 
+// ─── Disconnect ─────────────────────────────────────────────────────────
+
+async fn disconnect_source_for_workspace(
+    iroh_state: &IrohState,
+    workspace_path: &str,
+) -> Result<(), String> {
     // Prevent owner from disconnecting if there are other members
-    if let Ok(Some(config)) = read_p2p_config(&workspace_path) {
+    if let Ok(Some(config)) = read_p2p_config(workspace_path) {
         let guard = iroh_state.lock().await;
         if let Some(node) = guard.as_ref() {
             let my_node_id = get_node_id(node);
@@ -2085,24 +2777,23 @@ pub async fn p2p_disconnect_source(
         drop(guard);
     }
 
-    // Close active doc
+    // Close active doc — bump generation first to kill running sync tasks
     let mut guard = iroh_state.lock().await;
     if let Some(node) = guard.as_mut() {
+        node.bump_sync_generation();
         if let Some(doc) = node.active_doc.take() {
             let _ = doc.leave().await;
         }
     }
     drop(guard);
 
-    clear_p2p_and_team_dir(&workspace_path)?;
+    clear_p2p_and_team_dir(workspace_path)?;
 
     Ok(())
 }
 
-/// Dissolve the team. Only the owner can call this.
-/// Writes a tombstone to notify other members, then cleans up local data.
 #[tauri::command]
-pub async fn p2p_dissolve_team(
+pub async fn p2p_disconnect_source(
     iroh_state: tauri::State<'_, IrohState>,
     opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
 ) -> Result<(), String> {
@@ -2113,9 +2804,17 @@ pub async fn p2p_dissolve_team(
         .workspace_path
         .clone()
         .ok_or("No workspace path set")?;
+    disconnect_source_for_workspace(iroh_state.inner(), &workspace_path).await
+}
 
+/// Dissolve the team. Only the owner can call this.
+/// Writes a tombstone to notify other members, then cleans up local data.
+async fn dissolve_team_for_workspace(
+    iroh_state: &IrohState,
+    workspace_path: &str,
+) -> Result<(), String> {
     // Only owner can dissolve
-    let config = read_p2p_config(&workspace_path)?.unwrap_or_default();
+    let config = read_p2p_config(workspace_path)?.unwrap_or_default();
     if config.role != Some(MemberRole::Owner) {
         return Err("Only the team owner can dissolve the team".to_string());
     }
@@ -2140,9 +2839,24 @@ pub async fn p2p_dissolve_team(
     }
     drop(guard);
 
-    clear_p2p_and_team_dir(&workspace_path)?;
+    clear_p2p_and_team_dir(workspace_path)?;
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn p2p_dissolve_team(
+    iroh_state: tauri::State<'_, IrohState>,
+    opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
+) -> Result<(), String> {
+    let workspace_path = opencode_state
+        .inner
+        .lock()
+        .map_err(|e| e.to_string())?
+        .workspace_path
+        .clone()
+        .ok_or("No workspace path set")?;
+    dissolve_team_for_workspace(iroh_state.inner(), &workspace_path).await
 }
 
 // ─── Team Member Management ─────────────────────────────────────────────
@@ -2172,9 +2886,9 @@ pub fn add_member_to_team(
 
     // Any existing member (owner or editor) can add new members.
     let is_owner = owner_id == caller_node_id;
-    let is_member = members
-        .iter()
-        .any(|m| m.node_id == caller_node_id && matches!(m.role, MemberRole::Owner | MemberRole::Editor));
+    let is_member = members.iter().any(|m| {
+        m.node_id == caller_node_id && matches!(m.role, MemberRole::Owner | MemberRole::Editor)
+    });
     if !is_owner && !is_member {
         return Err("Only team members can add new members".to_string());
     }
@@ -2243,9 +2957,9 @@ pub fn remove_member_from_team(
     };
 
     let is_owner = owner_id == caller_node_id;
-    let is_editor = members
-        .iter()
-        .any(|m| m.node_id == caller_node_id && matches!(m.role, MemberRole::Owner | MemberRole::Editor));
+    let is_editor = members.iter().any(|m| {
+        m.node_id == caller_node_id && matches!(m.role, MemberRole::Owner | MemberRole::Editor)
+    });
     if !is_owner && !is_editor {
         return Err("Only team members (owner or editor) can manage members".to_string());
     }
@@ -2290,9 +3004,9 @@ pub fn update_member_role(
     };
 
     let is_owner = owner_id == caller_node_id;
-    let is_editor = members
-        .iter()
-        .any(|m| m.node_id == caller_node_id && matches!(m.role, MemberRole::Owner | MemberRole::Editor));
+    let is_editor = members.iter().any(|m| {
+        m.node_id == caller_node_id && matches!(m.role, MemberRole::Owner | MemberRole::Editor)
+    });
     if !is_owner && !is_editor {
         return Err("Only team members (owner or editor) can manage members".to_string());
     }
@@ -2534,6 +3248,7 @@ pub async fn p2p_create_team(
     owner_name: Option<String>,
     owner_email: Option<String>,
     iroh_state: tauri::State<'_, IrohState>,
+    engine_state: tauri::State<'_, SyncEngineState>,
     opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
 ) -> Result<String, String> {
     let workspace_path = opencode_state
@@ -2548,6 +3263,9 @@ pub async fn p2p_create_team(
     let node = guard.as_mut().ok_or("P2P node not running")?;
 
     let team_dir = format!("{}/{}", workspace_path, super::TEAM_REPO_DIR);
+    // TODO: init_shared_secrets for P2P mode once a team_secret is established.
+    // P2P mode currently does not pass a team_secret through create_team/join_team_drive.
+    // When P2P gets a team_secret, add an init_shared_secrets call here.
     create_team(
         node,
         &team_dir,
@@ -2559,6 +3277,7 @@ pub async fn p2p_create_team(
         owner_name,
         owner_email,
         Some(app),
+        engine_state.inner().clone(),
     )
     .await
 }
@@ -2566,6 +3285,7 @@ pub async fn p2p_create_team(
 #[tauri::command]
 pub async fn p2p_publish_drive(
     iroh_state: tauri::State<'_, IrohState>,
+    engine_state: tauri::State<'_, SyncEngineState>,
     opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
 ) -> Result<String, String> {
     let workspace_path = opencode_state
@@ -2594,6 +3314,7 @@ pub async fn p2p_publish_drive(
             None,
             None,
             None,
+            engine_state.inner().clone(),
         )
         .await;
     }
@@ -2616,6 +3337,7 @@ pub async fn p2p_join_drive(
     llm_model: Option<String>,
     llm_model_name: Option<String>,
     iroh_state: tauri::State<'_, IrohState>,
+    engine_state: tauri::State<'_, SyncEngineState>,
     opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
 ) -> Result<String, String> {
     let workspace_path = opencode_state
@@ -2630,7 +3352,15 @@ pub async fn p2p_join_drive(
     let node = guard.as_mut().ok_or("P2P node not running")?;
 
     let team_dir = format!("{}/{}", workspace_path, super::TEAM_REPO_DIR);
-    let result = join_team_drive(node, &ticket, &team_dir, &workspace_path, Some(app)).await?;
+    let result = join_team_drive(
+        node,
+        &ticket,
+        &team_dir,
+        &workspace_path,
+        Some(app),
+        engine_state.inner().clone(),
+    )
+    .await?;
 
     // Write LLM config to .teamclaw/teamclaw.json (same as oss_join_team and create_team)
     let llm_config =
@@ -2641,21 +3371,13 @@ pub async fn p2p_join_drive(
 }
 
 /// Reconnect to an existing team document on app restart.
-#[tauri::command]
-pub async fn p2p_reconnect(
-    app: tauri::AppHandle,
-    iroh_state: tauri::State<'_, IrohState>,
-    opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
+async fn reconnect_team_for_workspace(
+    node: &mut IrohNode,
+    workspace_path: &str,
+    app_handle: Option<tauri::AppHandle>,
+    engine: SyncEngineState,
 ) -> Result<(), String> {
-    let workspace_path = opencode_state
-        .inner
-        .lock()
-        .map_err(|e| e.to_string())?
-        .workspace_path
-        .clone()
-        .ok_or("No workspace path set")?;
-
-    let config = read_p2p_config(&workspace_path)?;
+    let config = read_p2p_config(workspace_path)?;
     let config = match config {
         Some(c) if c.enabled && c.namespace_id.is_some() => c,
         _ => return Ok(()), // No team to reconnect to
@@ -2663,13 +3385,13 @@ pub async fn p2p_reconnect(
 
     let _namespace_id_str = config.namespace_id.as_ref().unwrap();
 
-    let mut guard = iroh_state.lock().await;
-    let node = guard.as_mut().ok_or("P2P node not running")?;
-
     // Skip if already connected
     if node.active_doc.is_some() {
         return Ok(());
     }
+
+    // Kill any leftover sync tasks from a previous session
+    node.bump_sync_generation();
 
     let my_node_id = get_node_id(node);
     let is_owner = config
@@ -2703,7 +3425,7 @@ pub async fn p2p_reconnect(
     if !is_owner {
         if let Err(auth_err) = check_join_authorization(&team_dir, &my_node_id) {
             let _ = doc.close().await;
-            clear_p2p_and_team_dir(&workspace_path)?;
+            clear_p2p_and_team_dir(workspace_path)?;
             return Err(format!("Reconnect rejected: {}", auth_err));
         }
     }
@@ -2711,6 +3433,7 @@ pub async fn p2p_reconnect(
     let my_role = config.role.clone().unwrap_or(MemberRole::Editor);
 
     // Reconcile offline edits before starting watchers
+    let temp_engine: Arc<Mutex<SyncEngine>> = Arc::new(Mutex::new(SyncEngine::new()));
     if let Err(e) = reconcile_disk_and_doc(
         &doc,
         &node.store,
@@ -2718,6 +3441,8 @@ pub async fn p2p_reconnect(
         &team_dir,
         is_owner,
         &my_role,
+        &temp_engine,
+        app_handle.as_ref(),
     )
     .await
     {
@@ -2741,12 +3466,16 @@ pub async fn p2p_reconnect(
         Arc::new(Mutex::new(my_role)),
         my_node_id,
         config.owner_node_id.clone(),
-        Some(app),
+        app_handle,
         node.router.endpoint().clone(),
         config.doc_ticket.clone(),
         seed_ep,
         config.cached_peer_addrs.clone(),
-        Some(workspace_path.clone()),
+        Some(workspace_path.to_string()),
+        engine,
+        node.sync_generation_rx.clone(),
+        *node.sync_generation_rx.borrow(),
+        node.manifest_lock.clone(),
     );
 
     node.active_doc = Some(doc);
@@ -2754,10 +3483,37 @@ pub async fn p2p_reconnect(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn p2p_reconnect(
+    app: tauri::AppHandle,
+    iroh_state: tauri::State<'_, IrohState>,
+    engine_state: tauri::State<'_, SyncEngineState>,
+    opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
+) -> Result<(), String> {
+    let workspace_path = opencode_state
+        .inner
+        .lock()
+        .map_err(|e| e.to_string())?
+        .workspace_path
+        .clone()
+        .ok_or("No workspace path set")?;
+
+    let mut guard = iroh_state.lock().await;
+    let node = guard.as_mut().ok_or("P2P node not running")?;
+    reconnect_team_for_workspace(
+        node,
+        &workspace_path,
+        Some(app),
+        engine_state.inner().clone(),
+    )
+    .await
+}
+
 /// Regenerate the team ticket (namespace rotation). Owner only.
 #[tauri::command]
 pub async fn p2p_rotate_ticket(
     iroh_state: tauri::State<'_, IrohState>,
+    engine_state: tauri::State<'_, SyncEngineState>,
     opencode_state: tauri::State<'_, crate::commands::opencode::OpenCodeState>,
 ) -> Result<String, String> {
     let workspace_path = opencode_state
@@ -2772,7 +3528,13 @@ pub async fn p2p_rotate_ticket(
     let node = guard.as_mut().ok_or("P2P node not running")?;
 
     let team_dir = format!("{}/{}", workspace_path, super::TEAM_REPO_DIR);
-    rotate_namespace(node, &team_dir, &workspace_path).await
+    rotate_namespace(
+        node,
+        &team_dir,
+        &workspace_path,
+        engine_state.inner().clone(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2804,6 +3566,15 @@ pub async fn save_p2p_config(
     write_p2p_config(&workspace_path, Some(&config))
 }
 
+/// Get detailed node/engine status for the frontend popover.
+#[tauri::command]
+pub async fn p2p_node_status(
+    engine_state: tauri::State<'_, SyncEngineState>,
+) -> Result<EngineSnapshot, String> {
+    let eng = engine_state.lock().await;
+    Ok(eng.snapshot())
+}
+
 /// Get the current team sync status.
 #[tauri::command]
 pub async fn p2p_sync_status(
@@ -2832,10 +3603,13 @@ pub async fn p2p_sync_status(
     // includes own address + up to 4 random other known peers.
     let member_ticket = if let Some(node) = guard.as_ref() {
         if let Some(doc) = &node.active_doc {
-            match doc.share(
-                iroh_docs::api::protocol::ShareMode::Write,
-                iroh_docs::api::protocol::AddrInfoOptions::RelayAndAddresses,
-            ).await {
+            match doc
+                .share(
+                    iroh_docs::api::protocol::ShareMode::Write,
+                    iroh_docs::api::protocol::AddrInfoOptions::RelayAndAddresses,
+                )
+                .await
+            {
                 Ok(mut ticket) => {
                     // Collect other known peers from manifest + cache
                     let team_dir = format!("{}/{}", workspace_path, super::TEAM_REPO_DIR);
@@ -2856,9 +3630,13 @@ pub async fn p2p_sync_status(
                                     }
                                 }
                                 if addrs.is_empty() {
-                                    if let Some(cached) = config.cached_peer_addrs.get(&member.node_id) {
+                                    if let Some(cached) =
+                                        config.cached_peer_addrs.get(&member.node_id)
+                                    {
                                         for addr_str in cached {
-                                            if let Ok(sock) = addr_str.parse::<std::net::SocketAddr>() {
+                                            if let Ok(sock) =
+                                                addr_str.parse::<std::net::SocketAddr>()
+                                            {
                                                 addrs.insert(iroh::TransportAddr::Ip(sock));
                                             }
                                         }
@@ -3159,6 +3937,1064 @@ pub async fn p2p_skills_leaderboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_lite::StreamExt;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    struct TestPeer {
+        name: String,
+        workspace_dir: tempfile::TempDir,
+        _iroh_storage_dir: tempfile::TempDir,
+        team_dir: PathBuf,
+        node: IrohNode,
+        engine: SyncEngineState,
+    }
+
+    impl TestPeer {
+        async fn new(name: &str) -> Self {
+            let workspace_dir = tempfile::tempdir().unwrap();
+            let iroh_storage_dir = tempfile::tempdir().unwrap();
+            let team_dir = workspace_dir.path().join(crate::commands::TEAM_REPO_DIR);
+            std::fs::create_dir_all(&team_dir).unwrap();
+            let node = IrohNode::new(iroh_storage_dir.path()).await.unwrap();
+
+            Self {
+                name: name.to_string(),
+                workspace_dir,
+                _iroh_storage_dir: iroh_storage_dir,
+                team_dir,
+                node,
+                engine: Arc::new(Mutex::new(SyncEngine::new())),
+            }
+        }
+
+        fn workspace_path(&self) -> String {
+            self.workspace_dir.path().to_string_lossy().to_string()
+        }
+
+        fn team_dir_path(&self) -> String {
+            self.team_dir.to_string_lossy().to_string()
+        }
+
+        fn node_id(&self) -> String {
+            get_node_id(&self.node)
+        }
+
+        fn member(&self, role: MemberRole) -> TeamMember {
+            TeamMember {
+                node_id: self.node_id(),
+                name: self.name.clone(),
+                role,
+                label: self.name.clone(),
+                platform: std::env::consts::OS.to_string(),
+                arch: std::env::consts::ARCH.to_string(),
+                hostname: format!("{}-host", self.name.to_lowercase()),
+                added_at: chrono::Utc::now().to_rfc3339(),
+            }
+        }
+
+        async fn create_team(&mut self) -> String {
+            let workspace_path = self.workspace_path();
+            let team_dir = self.team_dir_path();
+            create_team(
+                &mut self.node,
+                &team_dir,
+                &workspace_path,
+                None,
+                None,
+                None,
+                Some("P2P Test Team".to_string()),
+                Some(self.name.clone()),
+                None,
+                None,
+                self.engine.clone(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn join_team(&mut self, ticket: &str) -> String {
+            let workspace_path = self.workspace_path();
+            let team_dir = self.team_dir_path();
+            join_team_drive(
+                &mut self.node,
+                ticket,
+                &team_dir,
+                &workspace_path,
+                None,
+                self.engine.clone(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn publish(&self) -> String {
+            let workspace_path = self.workspace_path();
+            let team_dir = self.team_dir_path();
+            publish_team_drive(&self.node, &team_dir, &workspace_path)
+                .await
+                .unwrap()
+        }
+
+        async fn inject_doc_entry(&self, key: &str, content: &[u8]) {
+            let doc = self
+                .node
+                .active_doc
+                .as_ref()
+                .expect("active doc should exist for raw doc writes");
+            doc.set_bytes(self.node.author, key.to_string(), content.to_vec())
+                .await
+                .unwrap();
+        }
+
+        fn write_file(&self, rel_path: &str, content: &str) {
+            let path = self.team_dir.join(rel_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
+
+        fn read_file(&self, rel_path: &str) -> Option<String> {
+            std::fs::read_to_string(self.team_dir.join(rel_path)).ok()
+        }
+
+        fn manifest(&self) -> TeamManifest {
+            read_members_manifest(&self.team_dir_path())
+                .unwrap()
+                .expect("members manifest should exist")
+        }
+
+        fn p2p_config(&self) -> Option<P2pConfig> {
+            read_p2p_config(&self.workspace_path()).unwrap()
+        }
+
+        async fn add_member_and_sync(&mut self, member: TeamMember) {
+            let workspace_path = self.workspace_path();
+            let team_dir = self.team_dir_path();
+            let caller_node_id = self.node_id();
+            add_member_to_team(&workspace_path, &team_dir, &caller_node_id, member).unwrap();
+            self.sync_members_manifest_to_doc().await;
+        }
+
+        async fn update_member_role_and_sync(
+            &mut self,
+            target_node_id: &str,
+            new_role: MemberRole,
+        ) {
+            let workspace_path = self.workspace_path();
+            let team_dir = self.team_dir_path();
+            let caller_node_id = self.node_id();
+            update_member_role(
+                &workspace_path,
+                &team_dir,
+                &caller_node_id,
+                target_node_id,
+                new_role,
+            )
+            .unwrap();
+            self.sync_members_manifest_to_doc().await;
+        }
+
+        async fn sync_members_manifest_to_doc(&self) {
+            let doc = self
+                .node
+                .active_doc
+                .as_ref()
+                .expect("active doc should exist for manifest sync");
+            let content = std::fs::read(self.team_dir.join("_team/members.json")).unwrap();
+            doc.set_bytes(self.node.author, "_team/members.json", content)
+                .await
+                .unwrap();
+        }
+
+        async fn reconnect(&mut self) -> Result<(), String> {
+            let workspace_path = self.workspace_path();
+            reconnect_team_for_workspace(&mut self.node, &workspace_path, None, self.engine.clone())
+                .await
+        }
+
+        async fn active_doc_has_key(&self, key: &str) -> bool {
+            let Some(doc) = self.node.active_doc.as_ref() else {
+                return false;
+            };
+            let query = iroh_docs::store::Query::single_latest_per_key().build();
+            let Ok(entries) = doc.get_many(query).await else {
+                return false;
+            };
+            let mut entries = std::pin::pin!(entries);
+            while let Some(Ok(entry)) = entries.next().await {
+                if String::from_utf8_lossy(entry.key()) == key {
+                    return true;
+                }
+            }
+            false
+        }
+
+        async fn shutdown(mut self) {
+            self.node.bump_sync_generation();
+            let _ = self.node.active_doc.take();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        async fn restart_node(&mut self) {
+            self.node.bump_sync_generation();
+            if let Some(doc) = self.node.active_doc.take() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), doc.leave()).await;
+            }
+            let storage_path = self._iroh_storage_dir.path().to_path_buf();
+            let replacement = IrohNode::new(&storage_path).await.unwrap();
+            let old_node = std::mem::replace(&mut self.node, replacement);
+            self.engine = Arc::new(Mutex::new(SyncEngine::new()));
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                old_node.router.shutdown(),
+            )
+            .await;
+        }
+    }
+
+    async fn wait_until(
+        timeout: std::time::Duration,
+        mut check: impl FnMut() -> bool,
+        description: &str,
+    ) {
+        let start = Instant::now();
+        loop {
+            if check() {
+                return;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "timed out waiting for {} after {:?}",
+                description,
+                timeout
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn assert_stays_false_for(
+        duration: std::time::Duration,
+        mut check: impl FnMut() -> bool,
+        description: &str,
+    ) {
+        let start = Instant::now();
+        loop {
+            assert!(
+                !check(),
+                "condition unexpectedly became true while waiting for {}",
+                description
+            );
+            if start.elapsed() >= duration {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn wait_until_async<F, Fut>(timeout: std::time::Duration, mut check: F, description: &str)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let start = Instant::now();
+        loop {
+            if check().await {
+                return;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "timed out waiting for {} after {:?}",
+                description,
+                timeout
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_create_join_and_initial_sync() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        owner.write_file("docs/hello.txt", "hello from owner");
+        let ticket = owner.create_team().await;
+        owner
+            .add_member_and_sync(joiner.member(MemberRole::Editor))
+            .await;
+
+        let result = joiner.join_team(&ticket).await;
+        assert!(result.contains("Synced"));
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/hello.txt").as_deref() == Some("hello from owner"),
+            "joiner initial file sync",
+        )
+        .await;
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_owner_publish_syncs_to_joiner() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        owner.write_file("docs/initial.txt", "v1");
+        let ticket = owner.create_team().await;
+        owner
+            .add_member_and_sync(joiner.member(MemberRole::Editor))
+            .await;
+        joiner.join_team(&ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/initial.txt").as_deref() == Some("v1"),
+            "joiner receives initial file",
+        )
+        .await;
+
+        owner.write_file("docs/initial.txt", "v2 from owner");
+        owner.publish().await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/initial.txt").as_deref() == Some("v2 from owner"),
+            "joiner receives owner update",
+        )
+        .await;
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_members_manifest_role_change_syncs() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        let ticket = owner.create_team().await;
+        let joiner_node_id = joiner.node_id();
+        owner
+            .add_member_and_sync(joiner.member(MemberRole::Editor))
+            .await;
+        joiner.join_team(&ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || {
+                joiner
+                    .manifest()
+                    .members
+                    .iter()
+                    .find(|m| m.node_id == joiner_node_id)
+                    .map(|m| m.role.clone())
+                    == Some(MemberRole::Editor)
+            },
+            "joiner manifest editor role",
+        )
+        .await;
+
+        owner
+            .update_member_role_and_sync(&joiner_node_id, MemberRole::Viewer)
+            .await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || {
+                joiner
+                    .manifest()
+                    .members
+                    .iter()
+                    .find(|m| m.node_id == joiner_node_id)
+                    .map(|m| m.role.clone())
+                    == Some(MemberRole::Viewer)
+            },
+            "joiner manifest viewer role",
+        )
+        .await;
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_viewer_cannot_sync_new_writes() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        owner.write_file("docs/shared.txt", "seed");
+        let ticket = owner.create_team().await;
+        let joiner_node_id = joiner.node_id();
+        owner
+            .add_member_and_sync(joiner.member(MemberRole::Editor))
+            .await;
+        joiner.join_team(&ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/shared.txt").as_deref() == Some("seed"),
+            "joiner receives seed file",
+        )
+        .await;
+
+        owner
+            .update_member_role_and_sync(&joiner_node_id, MemberRole::Viewer)
+            .await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || {
+                joiner
+                    .manifest()
+                    .members
+                    .iter()
+                    .find(|m| m.node_id == joiner_node_id)
+                    .map(|m| m.role.clone())
+                    == Some(MemberRole::Viewer)
+            },
+            "joiner manifest viewer role before write attempt",
+        )
+        .await;
+
+        joiner.write_file("docs/viewer-write.txt", "should not replicate");
+        let publish_result = joiner.publish().await;
+        assert!(
+            publish_result.contains("Synced") || publish_result.contains("0"),
+            "unexpected publish result: {}",
+            publish_result
+        );
+
+        assert_stays_false_for(
+            std::time::Duration::from_secs(5),
+            || owner.read_file("docs/viewer-write.txt").is_some(),
+            "viewer write staying absent on owner",
+        )
+        .await;
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_removed_member_receives_removal_manifest() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        let ticket = owner.create_team().await;
+        let joiner_member = joiner.member(MemberRole::Editor);
+        let joiner_node_id = joiner_member.node_id.clone();
+        owner.add_member_and_sync(joiner_member).await;
+        joiner.join_team(&ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || {
+                joiner
+                    .manifest()
+                    .members
+                    .iter()
+                    .any(|m| m.node_id == joiner_node_id)
+            },
+            "joiner initially appears in local manifest",
+        )
+        .await;
+
+        let workspace_path = owner.workspace_path();
+        let team_dir = owner.team_dir_path();
+        let owner_node_id = owner.node_id();
+        remove_member_from_team(&workspace_path, &team_dir, &owner_node_id, &joiner_node_id)
+            .unwrap();
+        owner.sync_members_manifest_to_doc().await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || {
+                !joiner
+                    .manifest()
+                    .members
+                    .iter()
+                    .any(|m| m.node_id == joiner_node_id)
+            },
+            "joiner receives removal in members manifest",
+        )
+        .await;
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_removed_member_cannot_rejoin_with_preserved_identity() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        owner.write_file("docs/owner.txt", "owned by owner");
+        let ticket = owner.create_team().await;
+        let joiner_member = joiner.member(MemberRole::Editor);
+        let joiner_node_id = joiner_member.node_id.clone();
+        owner.add_member_and_sync(joiner_member).await;
+        joiner.join_team(&ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/owner.txt").as_deref() == Some("owned by owner"),
+            "joiner receives initial owner file before removal",
+        )
+        .await;
+
+        // Simulate app restart / offline period on the removed member side.
+        // The local members.json still contains the old allowlist at this point.
+        joiner.restart_node().await;
+
+        let workspace_path = owner.workspace_path();
+        let team_dir = owner.team_dir_path();
+        let owner_node_id = owner.node_id();
+        remove_member_from_team(&workspace_path, &team_dir, &owner_node_id, &joiner_node_id)
+            .unwrap();
+        owner.sync_members_manifest_to_doc().await;
+
+        let joiner_team_dir = joiner.team_dir_path();
+        let joiner_workspace_path = joiner.workspace_path();
+        let joiner_engine = joiner.engine.clone();
+        let rejoin_result = join_team_drive(
+            &mut joiner.node,
+            &ticket,
+            &joiner_team_dir,
+            &joiner_workspace_path,
+            None,
+            joiner_engine,
+        )
+        .await;
+
+        assert!(
+            rejoin_result.is_err(),
+            "removed member should not be able to rejoin with preserved identity"
+        );
+        let err = rejoin_result.unwrap_err();
+        assert!(
+            err.contains("Not authorized") || err.contains("not authorized"),
+            "unexpected rejoin error: {}",
+            err
+        );
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_reconnect_happy_path_resumes_sync() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        owner.write_file("docs/seed.txt", "before reconnect");
+        let ticket = owner.create_team().await;
+        owner
+            .add_member_and_sync(joiner.member(MemberRole::Editor))
+            .await;
+        joiner.join_team(&ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/seed.txt").as_deref() == Some("before reconnect"),
+            "joiner receives seed file before reconnect",
+        )
+        .await;
+
+        joiner.restart_node().await;
+        assert!(
+            joiner.node.active_doc.is_none(),
+            "restart should leave joiner without an active doc"
+        );
+
+        joiner.reconnect().await.unwrap();
+        assert!(
+            joiner.node.active_doc.is_some(),
+            "reconnect should restore the active doc"
+        );
+
+        owner.write_file("docs/post-reconnect.txt", "after reconnect");
+        owner.publish().await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/post-reconnect.txt").as_deref() == Some("after reconnect"),
+            "joiner receives owner update after reconnect",
+        )
+        .await;
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_leave_team_removes_member_and_cleans_local_state() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        let ticket = owner.create_team().await;
+        let joiner_member = joiner.member(MemberRole::Editor);
+        let joiner_node_id = joiner_member.node_id.clone();
+        owner.add_member_and_sync(joiner_member).await;
+        joiner.join_team(&ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || {
+                joiner
+                    .manifest()
+                    .members
+                    .iter()
+                    .any(|m| m.node_id == joiner_node_id)
+            },
+            "joiner appears in manifest before leave",
+        )
+        .await;
+
+        let joiner_workspace_path = joiner.workspace_path();
+        let joiner_state: IrohState = Arc::new(Mutex::new(Some(joiner.node)));
+        leave_team_for_workspace(&joiner_state, &joiner_workspace_path)
+            .await
+            .unwrap();
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || {
+                !owner
+                    .manifest()
+                    .members
+                    .iter()
+                    .any(|m| m.node_id == joiner_node_id)
+            },
+            "owner receives member leave removal",
+        )
+        .await;
+
+        let joiner_node = joiner_state
+            .lock()
+            .await
+            .take()
+            .expect("joiner node should still be present");
+        joiner.node = joiner_node;
+
+        assert!(
+            !joiner.team_dir.exists(),
+            "leave should remove the local team directory"
+        );
+        assert!(
+            joiner.p2p_config().is_none(),
+            "leave should clear local P2P config"
+        );
+        assert!(
+            joiner.node.active_doc.is_none(),
+            "leave should close the local active doc"
+        );
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_dissolve_team_writes_marker_and_cleans_owner_state() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        let ticket = owner.create_team().await;
+        owner
+            .add_member_and_sync(joiner.member(MemberRole::Editor))
+            .await;
+        joiner.join_team(&ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.manifest().members.len() == 2,
+            "joiner sees shared manifest before dissolve",
+        )
+        .await;
+
+        let owner_workspace_path = owner.workspace_path();
+        let owner_state: IrohState = Arc::new(Mutex::new(Some(owner.node)));
+        dissolve_team_for_workspace(&owner_state, &owner_workspace_path)
+            .await
+            .unwrap();
+
+        wait_until_async(
+            std::time::Duration::from_secs(15),
+            || joiner.active_doc_has_key("_team/dissolved"),
+            "joiner receives dissolved marker",
+        )
+        .await;
+
+        let owner_node = owner_state
+            .lock()
+            .await
+            .take()
+            .expect("owner node should still be present");
+        owner.node = owner_node;
+
+        assert!(
+            !owner.team_dir.exists(),
+            "dissolve should remove the owner's local team directory"
+        );
+        assert!(
+            owner.p2p_config().is_none(),
+            "dissolve should clear the owner's local P2P config"
+        );
+        assert!(
+            owner.node.active_doc.is_none(),
+            "dissolve should close the owner's active doc"
+        );
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_source_cleans_local_state_for_single_owner() {
+        let mut owner = TestPeer::new("Owner").await;
+        owner.create_team().await;
+
+        let owner_workspace_path = owner.workspace_path();
+        let owner_state: IrohState = Arc::new(Mutex::new(Some(owner.node)));
+        disconnect_source_for_workspace(&owner_state, &owner_workspace_path)
+            .await
+            .unwrap();
+
+        let owner_node = owner_state
+            .lock()
+            .await
+            .take()
+            .expect("owner node should still be present");
+        owner.node = owner_node;
+
+        assert!(
+            !owner.team_dir.exists(),
+            "disconnect should remove the local team directory"
+        );
+        assert!(
+            owner.p2p_config().is_none(),
+            "disconnect should clear local P2P config"
+        );
+        assert!(
+            owner.node.active_doc.is_none(),
+            "disconnect should close the active doc"
+        );
+
+        owner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_source_rejects_owner_with_existing_members() {
+        let mut owner = TestPeer::new("Owner").await;
+        let joiner = TestPeer::new("Joiner").await;
+
+        owner.create_team().await;
+        owner
+            .add_member_and_sync(joiner.member(MemberRole::Editor))
+            .await;
+
+        let owner_workspace_path = owner.workspace_path();
+        let owner_state: IrohState = Arc::new(Mutex::new(Some(owner.node)));
+        let result = disconnect_source_for_workspace(&owner_state, &owner_workspace_path).await;
+
+        assert!(
+            result.is_err(),
+            "owner disconnect should be rejected while members remain"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("还有其他成员"),
+            "unexpected disconnect rejection message: {}",
+            err
+        );
+
+        let owner_node = owner_state
+            .lock()
+            .await
+            .take()
+            .expect("owner node should still be present");
+        owner.node = owner_node;
+
+        assert!(
+            owner.team_dir.exists(),
+            "rejected disconnect must not remove the local team directory"
+        );
+        assert!(
+            owner.p2p_config().is_some(),
+            "rejected disconnect must not clear local P2P config"
+        );
+        assert!(
+            owner.node.active_doc.is_some(),
+            "rejected disconnect must keep the active doc open"
+        );
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_reconnect_reconciles_owner_offline_edits() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        owner.write_file("docs/shared.txt", "seed");
+        let ticket = owner.create_team().await;
+        owner
+            .add_member_and_sync(joiner.member(MemberRole::Editor))
+            .await;
+        joiner.join_team(&ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/shared.txt").as_deref() == Some("seed"),
+            "joiner receives seed file before owner reconnect reconcile",
+        )
+        .await;
+
+        owner.restart_node().await;
+        owner.write_file("docs/shared.txt", "offline owner edit");
+        assert!(
+            owner.node.active_doc.is_none(),
+            "owner restart should leave no active doc before reconnect"
+        );
+
+        owner.reconnect().await.unwrap();
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/shared.txt").as_deref() == Some("offline owner edit"),
+            "joiner receives owner offline edit after reconnect reconcile",
+        )
+        .await;
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_no_team_is_noop() {
+        let mut peer = TestPeer::new("Peer").await;
+
+        let result = peer.reconnect().await;
+        assert!(
+            result.is_ok(),
+            "reconnect without saved team should be a no-op"
+        );
+        assert!(
+            peer.node.active_doc.is_none(),
+            "no-op reconnect should not attach an active doc"
+        );
+
+        peer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_missing_saved_ticket_returns_error() {
+        let mut peer = TestPeer::new("Peer").await;
+        let workspace_path = peer.workspace_path();
+        let config = P2pConfig {
+            enabled: true,
+            namespace_id: Some("ns-missing-ticket".to_string()),
+            owner_node_id: Some(peer.node_id()),
+            role: Some(MemberRole::Owner),
+            ..Default::default()
+        };
+        write_p2p_config(&workspace_path, Some(&config)).unwrap();
+
+        let result = peer.reconnect().await;
+        assert!(
+            result.is_err(),
+            "reconnect should fail without a saved ticket"
+        );
+        assert!(
+            result.unwrap_err().contains("No saved ticket"),
+            "reconnect should explain that the saved ticket is missing"
+        );
+        assert!(
+            peer.node.active_doc.is_none(),
+            "failed reconnect should not attach an active doc"
+        );
+
+        peer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_invalid_saved_ticket_returns_error() {
+        let mut peer = TestPeer::new("Peer").await;
+        let workspace_path = peer.workspace_path();
+        let config = P2pConfig {
+            enabled: true,
+            namespace_id: Some("ns-invalid-ticket".to_string()),
+            doc_ticket: Some("definitely-not-a-doc-ticket".to_string()),
+            owner_node_id: Some(peer.node_id()),
+            role: Some(MemberRole::Owner),
+            ..Default::default()
+        };
+        write_p2p_config(&workspace_path, Some(&config)).unwrap();
+
+        let result = peer.reconnect().await;
+        assert!(
+            result.is_err(),
+            "reconnect should fail with an invalid saved ticket"
+        );
+        assert!(
+            result.unwrap_err().contains("Invalid saved ticket"),
+            "reconnect should explain that the saved ticket is invalid"
+        );
+        assert!(
+            peer.node.active_doc.is_none(),
+            "failed reconnect should not attach an active doc"
+        );
+
+        peer.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_rotate_ticket_preserves_existing_member_access() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        owner.write_file("docs/shared.txt", "before rotate");
+        let original_ticket = owner.create_team().await;
+        let joiner_member = joiner.member(MemberRole::Editor);
+        let joiner_node_id = joiner_member.node_id.clone();
+        owner.add_member_and_sync(joiner_member).await;
+        joiner.join_team(&original_ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/shared.txt").as_deref() == Some("before rotate"),
+            "joiner receives initial shared file before rotation",
+        )
+        .await;
+
+        let owner_team_dir = owner.team_dir_path();
+        let owner_workspace_path = owner.workspace_path();
+        let owner_engine = owner.engine.clone();
+        let rotated_ticket = rotate_namespace(
+            &mut owner.node,
+            &owner_team_dir,
+            &owner_workspace_path,
+            owner_engine,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            owner
+                .manifest()
+                .members
+                .iter()
+                .any(|m| m.node_id == joiner_node_id),
+            "ticket rotation should preserve existing members in the manifest"
+        );
+
+        joiner.restart_node().await;
+        joiner.join_team(&rotated_ticket).await;
+
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || joiner.read_file("docs/shared.txt").as_deref() == Some("before rotate"),
+            "existing member rejoins rotated namespace and keeps access",
+        )
+        .await;
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Uses real iroh nodes and file watchers; run explicitly with --ignored --test-threads=1"]
+    async fn test_real_p2p_unauthorized_join_does_not_leave_synced_files() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut intruder = TestPeer::new("Intruder").await;
+
+        owner.write_file("docs/private.txt", "owner-only secret");
+        let ticket = owner.create_team().await;
+
+        let intruder_team_dir = intruder.team_dir_path();
+        let intruder_workspace_path = intruder.workspace_path();
+        let intruder_engine = intruder.engine.clone();
+        let intruder_private_file = intruder.team_dir.join("docs/private.txt");
+        let join_result = join_team_drive(
+            &mut intruder.node,
+            &ticket,
+            &intruder_team_dir,
+            &intruder_workspace_path,
+            None,
+            intruder_engine,
+        )
+        .await;
+
+        assert!(
+            join_result.is_err(),
+            "unauthorized join should be rejected once members manifest syncs"
+        );
+        let err = join_result.unwrap_err();
+        assert!(
+            err.contains("Not authorized") || err.contains("not authorized"),
+            "unexpected unauthorized join error: {}",
+            err
+        );
+        assert!(
+            !intruder_private_file.exists(),
+            "unauthorized join must not leave synced business files on disk"
+        );
+        assert!(
+            intruder.read_file("docs/private.txt").is_none(),
+            "unauthorized join should not keep readable private content locally"
+        );
+
+        owner.shutdown().await;
+        intruder.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Security regression test using real iroh sync; expected to fail until path validation is enforced"]
+    async fn test_real_p2p_malicious_doc_key_cannot_escape_team_dir() {
+        let mut owner = TestPeer::new("Owner").await;
+        let mut joiner = TestPeer::new("Joiner").await;
+
+        let ticket = owner.create_team().await;
+        owner
+            .add_member_and_sync(joiner.member(MemberRole::Editor))
+            .await;
+        joiner.join_team(&ticket).await;
+
+        let escaped_path = Path::new(&joiner.workspace_path()).join("escaped.txt");
+        assert!(
+            !escaped_path.exists(),
+            "precondition failed: escaped path already exists"
+        );
+
+        owner
+            .inject_doc_entry("../escaped.txt", b"malicious traversal payload")
+            .await;
+
+        assert_stays_false_for(
+            std::time::Duration::from_secs(5),
+            || escaped_path.exists(),
+            "path traversal creating workspace-level file",
+        )
+        .await;
+
+        owner.shutdown().await;
+        joiner.shutdown().await;
+    }
 
     #[tokio::test]
     async fn test_iroh_node_creates_and_shuts_down() {
@@ -3187,6 +5023,7 @@ mod tests {
             team_dir.to_str().unwrap(),
             tmp.path().to_str().unwrap(),
             None,
+            Arc::new(Mutex::new(SyncEngine::new())),
         )
         .await;
         assert!(result.is_err(), "should fail with invalid ticket");
@@ -3222,6 +5059,7 @@ mod tests {
             None,
             None,
             None,
+            Arc::new(Mutex::new(SyncEngine::new())),
         )
         .await
         .unwrap();
@@ -3660,8 +5498,7 @@ mod tests {
             hostname: "new-box".to_string(),
             added_at: "2026-01-03T00:00:00Z".to_string(),
         };
-        add_member_to_team(workspace, team_dir.to_str().unwrap(), editor_id, new_member)
-            .unwrap();
+        add_member_to_team(workspace, team_dir.to_str().unwrap(), editor_id, new_member).unwrap();
 
         let config = read_p2p_config(workspace).unwrap().unwrap();
         assert_eq!(config.allowed_members.len(), 3);
@@ -3724,12 +5561,8 @@ mod tests {
             hostname: "new".to_string(),
             added_at: "2026-01-03T00:00:00Z".to_string(),
         };
-        let result = add_member_to_team(
-            workspace,
-            team_dir.to_str().unwrap(),
-            viewer_id,
-            new_member,
-        );
+        let result =
+            add_member_to_team(workspace, team_dir.to_str().unwrap(), viewer_id, new_member);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Only team members"));
     }
@@ -3802,6 +5635,7 @@ mod tests {
             None,
             None,
             None,
+            Arc::new(Mutex::new(SyncEngine::new())),
         )
         .await
         .unwrap();
@@ -3979,5 +5813,206 @@ mod tests {
         assert!(json.get("p2p").is_some(), "p2p config should exist");
         assert_eq!(json["team"]["gitUrl"], "https://example.com/repo.git");
         assert_eq!(json["p2p"]["enabled"], false);
+    }
+
+    // ─── SyncEngine unit tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_sync_engine_new_defaults() {
+        let engine = SyncEngine::new();
+        assert_eq!(engine.status, EngineStatus::Disconnected);
+        assert_eq!(engine.stream_health, StreamHealth::Dead);
+        assert_eq!(engine.restart_count, 0);
+        assert!(engine.last_sync_at.is_none());
+        assert!(engine.peers.is_empty());
+        assert!(engine.file_sync_records.is_empty());
+        assert_eq!(engine.synced_files, 0);
+        assert_eq!(engine.pending_files, 0);
+    }
+
+    #[test]
+    fn test_sync_engine_snapshot() {
+        let mut engine = SyncEngine::new();
+        engine.status = EngineStatus::Connected;
+        engine.stream_health = StreamHealth::Healthy;
+        engine.synced_files = 42;
+
+        let snap = engine.snapshot();
+        assert_eq!(snap.status, EngineStatus::Connected);
+        assert_eq!(snap.stream_health, StreamHealth::Healthy);
+        assert_eq!(snap.synced_files, 42);
+        assert!(snap.peers.is_empty());
+    }
+
+    #[test]
+    fn test_peer_state_connection_unknown() {
+        let peer = PeerState {
+            node_id: "test".to_string(),
+            name: "Test".to_string(),
+            role: MemberRole::Editor,
+            last_activity: None,
+            entries_sent: 0,
+            entries_received: 0,
+        };
+        assert_eq!(peer.connection(), PeerConnection::Unknown);
+    }
+
+    #[test]
+    fn test_peer_state_connection_active() {
+        let peer = PeerState {
+            node_id: "test".to_string(),
+            name: "Test".to_string(),
+            role: MemberRole::Editor,
+            last_activity: Some(Instant::now()),
+            entries_sent: 0,
+            entries_received: 0,
+        };
+        assert_eq!(peer.connection(), PeerConnection::Active);
+    }
+
+    #[test]
+    fn test_peer_state_connection_stale() {
+        let peer = PeerState {
+            node_id: "test".to_string(),
+            name: "Test".to_string(),
+            role: MemberRole::Editor,
+            last_activity: Some(Instant::now() - std::time::Duration::from_secs(60)),
+            entries_sent: 0,
+            entries_received: 0,
+        };
+        assert_eq!(peer.connection(), PeerConnection::Stale);
+    }
+
+    #[test]
+    fn test_peer_state_connection_lost() {
+        let peer = PeerState {
+            node_id: "test".to_string(),
+            name: "Test".to_string(),
+            role: MemberRole::Editor,
+            last_activity: Some(Instant::now() - std::time::Duration::from_secs(300)),
+            entries_sent: 0,
+            entries_received: 0,
+        };
+        assert_eq!(peer.connection(), PeerConnection::Lost);
+    }
+
+    #[test]
+    fn test_record_sync_finished() {
+        let mut engine = SyncEngine::new();
+        engine.peers.insert(
+            "peer1".to_string(),
+            PeerState {
+                node_id: "peer1".to_string(),
+                name: "Peer1".to_string(),
+                role: MemberRole::Editor,
+                last_activity: None,
+                entries_sent: 0,
+                entries_received: 0,
+            },
+        );
+
+        engine.record_sync_finished("peer1", 5, 10);
+
+        let peer = engine.peers.get("peer1").unwrap();
+        assert_eq!(peer.entries_sent, 5);
+        assert_eq!(peer.entries_received, 10);
+        assert!(peer.last_activity.is_some());
+        assert!(engine.last_sync_at.is_some());
+    }
+
+    #[test]
+    fn test_record_neighbor_up() {
+        let mut engine = SyncEngine::new();
+        engine.peers.insert(
+            "peer1".to_string(),
+            PeerState {
+                node_id: "peer1".to_string(),
+                name: "Peer1".to_string(),
+                role: MemberRole::Editor,
+                last_activity: None,
+                entries_sent: 0,
+                entries_received: 0,
+            },
+        );
+
+        engine.record_neighbor_up("peer1");
+
+        let peer = engine.peers.get("peer1").unwrap();
+        assert!(peer.last_activity.is_some());
+        assert_eq!(peer.connection(), PeerConnection::Active);
+    }
+
+    #[test]
+    fn test_record_file_synced() {
+        let mut engine = SyncEngine::new();
+        let now = SystemTime::now();
+        engine.record_file_synced("test.txt".to_string(), now);
+
+        assert!(engine.file_sync_records.contains_key("test.txt"));
+        assert_eq!(
+            engine
+                .file_sync_records
+                .get("test.txt")
+                .unwrap()
+                .local_mtime_at_sync,
+            now
+        );
+    }
+
+    #[test]
+    fn test_snapshot_includes_peer_info() {
+        let mut engine = SyncEngine::new();
+        engine.peers.insert(
+            "peer1".to_string(),
+            PeerState {
+                node_id: "peer1".to_string(),
+                name: "Alice".to_string(),
+                role: MemberRole::Owner,
+                last_activity: Some(Instant::now()),
+                entries_sent: 10,
+                entries_received: 20,
+            },
+        );
+
+        let snap = engine.snapshot();
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(snap.peers[0].node_id, "peer1");
+        assert_eq!(snap.peers[0].name, "Alice");
+        assert_eq!(snap.peers[0].connection, PeerConnection::Active);
+        assert_eq!(snap.peers[0].entries_sent, 10);
+        assert_eq!(snap.peers[0].entries_received, 20);
+    }
+
+    #[test]
+    fn test_load_peers_from_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team_dir = tmp.path().join("teamclaw-team");
+        let team_meta = team_dir.join("_team");
+        std::fs::create_dir_all(&team_meta).unwrap();
+
+        // Write a members.json (camelCase keys to match serde rename)
+        let manifest = serde_json::json!({
+            "ownerNodeId": "node_owner",
+            "members": [
+                { "nodeId": "node_owner", "name": "Owner", "role": "owner", "platform": "", "arch": "", "hostname": "", "addedAt": "" },
+                { "nodeId": "node_editor", "name": "Editor", "role": "editor", "platform": "", "arch": "", "hostname": "", "addedAt": "" },
+            ]
+        });
+        std::fs::write(
+            team_meta.join("members.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut engine = SyncEngine::new();
+        let _ = engine.load_peers_from_manifest(team_dir.to_str().unwrap());
+
+        assert_eq!(engine.peers.len(), 2);
+        assert!(engine.peers.contains_key("node_owner"));
+        assert!(engine.peers.contains_key("node_editor"));
+        assert_eq!(
+            engine.peers.get("node_owner").unwrap().role,
+            MemberRole::Owner
+        );
     }
 }

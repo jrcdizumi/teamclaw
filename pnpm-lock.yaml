@@ -258,6 +258,24 @@ importers:
       '@eslint/js':
         specifier: ^10.0.1
         version: 10.0.1(eslint@9.39.4(jiti@2.6.1))
+      '@tailwindcss/oxide-darwin-arm64':
+        specifier: ^4.1.18
+        version: 4.2.2
+      '@tailwindcss/oxide-darwin-x64':
+        specifier: ^4.1.18
+        version: 4.2.2
+      '@tailwindcss/oxide-linux-arm64-gnu':
+        specifier: ^4.1.18
+        version: 4.2.2
+      '@tailwindcss/oxide-linux-x64-gnu':
+        specifier: ^4.1.18
+        version: 4.2.2
+      '@tailwindcss/oxide-win32-arm64-msvc':
+        specifier: ^4.1.18
+        version: 4.2.2
+      '@tailwindcss/oxide-win32-x64-msvc':
+        specifier: ^4.1.18
+        version: 4.2.2
       '@tailwindcss/vite':
         specifier: ^4.1.18
         version: 4.2.2(vite@6.4.1(jiti@2.6.1)(lightningcss@1.32.0))
@@ -2180,7 +2198,6 @@ packages:
     engines: {node: '>= 20'}
     cpu: [arm64]
     os: [linux]
-    libc: [glibc]
 
   '@tailwindcss/oxide-linux-arm64-musl@4.2.2':
     resolution: {integrity: sha512-oCfG/mS+/+XRlwNjnsNLVwnMWYH7tn/kYPsNPh+JSOMlnt93mYNCKHYzylRhI51X+TbR+ufNhhKKzm6QkqX8ag==}
@@ -2194,7 +2211,6 @@ packages:
     engines: {node: '>= 20'}
     cpu: [x64]
     os: [linux]
-    libc: [glibc]
 
   '@tailwindcss/oxide-linux-x64-musl@4.2.2':
     resolution: {integrity: sha512-XW3t3qwbIwiSyRCggeO2zxe3KWaEbM0/kW9e8+0XpBgyKU4ATYzcVSMKteZJ1iukJ3HgHBjbg9P5YPRCVUxlnQ==}
@@ -7115,11 +7131,9 @@ snapshots:
   '@tailwindcss/oxide-android-arm64@4.2.2':
     optional: true
 
-  '@tailwindcss/oxide-darwin-arm64@4.2.2':
-    optional: true
+  '@tailwindcss/oxide-darwin-arm64@4.2.2': {}
 
-  '@tailwindcss/oxide-darwin-x64@4.2.2':
-    optional: true
+  '@tailwindcss/oxide-darwin-x64@4.2.2': {}
 
   '@tailwindcss/oxide-freebsd-x64@4.2.2':
     optional: true
@@ -7127,14 +7141,12 @@ snapshots:
   '@tailwindcss/oxide-linux-arm-gnueabihf@4.2.2':
     optional: true
 
-  '@tailwindcss/oxide-linux-arm64-gnu@4.2.2':
-    optional: true
+  '@tailwindcss/oxide-linux-arm64-gnu@4.2.2': {}
 
   '@tailwindcss/oxide-linux-arm64-musl@4.2.2':
     optional: true
 
-  '@tailwindcss/oxide-linux-x64-gnu@4.2.2':
-    optional: true
+  '@tailwindcss/oxide-linux-x64-gnu@4.2.2': {}
 
   '@tailwindcss/oxide-linux-x64-musl@4.2.2':
     optional: true
@@ -7142,11 +7154,9 @@ snapshots:
   '@tailwindcss/oxide-wasm32-wasi@4.2.2':
     optional: true
 
-  '@tailwindcss/oxide-win32-arm64-msvc@4.2.2':
-    optional: true
+  '@tailwindcss/oxide-win32-arm64-msvc@4.2.2': {}
 
-  '@tailwindcss/oxide-win32-x64-msvc@4.2.2':
-    optional: true
+  '@tailwindcss/oxide-win32-x64-msvc@4.2.2': {}
 
   '@tailwindcss/oxide@4.2.2':
     optionalDependencies:

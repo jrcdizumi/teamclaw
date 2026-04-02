@@ -122,6 +122,7 @@ pub enum DocType {
     Skills,
     Mcp,
     Knowledge,
+    Secrets,
 }
 
 impl DocType {
@@ -130,6 +131,7 @@ impl DocType {
             DocType::Skills => "skills",
             DocType::Mcp => "mcp",
             DocType::Knowledge => "knowledge",
+            DocType::Secrets => "secrets",
         }
     }
 
@@ -138,11 +140,12 @@ impl DocType {
             DocType::Skills => "skills",
             DocType::Mcp => ".mcp",
             DocType::Knowledge => "knowledge",
+            DocType::Secrets => "_secrets",
         }
     }
 
-    pub fn all() -> [DocType; 3] {
-        [DocType::Skills, DocType::Mcp, DocType::Knowledge]
+    pub fn all() -> [DocType; 4] {
+        [DocType::Skills, DocType::Mcp, DocType::Knowledge, DocType::Secrets]
     }
 }
 
@@ -160,4 +163,18 @@ pub struct FileSyncStatus {
     pub path: String,
     pub doc_type: String,
     pub status: SyncFileStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncCursor {
+    /// Last processed update key per DocType (for start_after pruning)
+    #[serde(default)]
+    pub last_known_keys: HashMap<String, String>,
+    /// Signal flag keys already processed
+    #[serde(default)]
+    pub known_signal_keys: Vec<String>,
+    /// Last compaction timestamp per DocType (RFC3339)
+    #[serde(default)]
+    pub last_compaction_at: HashMap<String, String>,
 }

@@ -283,10 +283,12 @@ pub fn run() {
             wvm
         })
         .manage(<commands::p2p_state::IrohState>::default())
+        .manage(<commands::p2p_state::SyncEngineState>::default())
         .manage(commands::spotlight::SpotlightState::default())
         .manage(tokio::sync::Mutex::new(commands::team_webdav::WebDavManagedState::default()))
         .manage(commands::oss_sync::OssSyncState::default())
         .manage(commands::version_commands::VersionStoreState::default())
+        .manage(commands::shared_secrets::SharedSecretsState::default())
         .invoke_handler(tauri::generate_handler![
             commands::greet,
             commands::show_in_folder,
@@ -450,6 +452,8 @@ pub fn run() {
             #[cfg(feature = "p2p")]
             commands::team_p2p::p2p_rotate_ticket,
             #[cfg(feature = "p2p")]
+            commands::team_p2p::p2p_node_status,
+            #[cfg(feature = "p2p")]
             commands::team_p2p::p2p_sync_status,
             #[cfg(feature = "p2p")]
             commands::team_p2p::p2p_get_files_sync_status,
@@ -487,6 +491,9 @@ pub fn run() {
             commands::env_vars::env_var_delete,
             commands::env_vars::env_var_list,
             commands::env_vars::env_var_resolve,
+            commands::shared_secrets::shared_secret_set,
+            commands::shared_secrets::shared_secret_delete,
+            commands::shared_secrets::shared_secret_list,
             commands::local_stats::read_local_stats,
             commands::local_stats::write_local_stats,
             commands::local_stats::update_local_stats,
