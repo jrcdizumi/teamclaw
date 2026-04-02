@@ -5,7 +5,6 @@ import remarkGfm from "remark-gfm"
 import {
   Search,
   Download,
-  ExternalLink,
   TrendingUp,
   Clock,
   Award,
@@ -353,14 +352,6 @@ export const SkillsMarketplace = React.memo(function SkillsMarketplace({
       setIsLoadingContent(false)
     }
   }, [])
-
-  const handleOpenSkillsSh = async () => {
-    try {
-      await openExternalUrl("https://skills.sh")
-    } catch (err) {
-      console.error("[SkillsMarketplace] Failed to open skills.sh:", err)
-    }
-  }
 
   return (
     <div className="space-y-4">
