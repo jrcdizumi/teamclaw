@@ -900,10 +900,32 @@ export const SkillsMarketplace = React.memo(function SkillsMarketplace({
               {/* Content */}
               {skillContent ? (
                 (() => {
+                  const isHtml = skillContent.trimStart().startsWith('<')
+                  if (isHtml) {
+                    return (
+                      <div
+                        className="prose prose-sm dark:prose-invert max-w-none
+                          [&_h1]:text-xl [&_h1]:font-bold [&_h1]:mt-6 [&_h1]:mb-3 [&_h1:first-child]:mt-0
+                          [&_h2]:text-lg [&_h2]:font-bold [&_h2]:mt-6 [&_h2]:mb-3
+                          [&_h3]:text-base [&_h3]:font-semibold [&_h3]:mt-5 [&_h3]:mb-2
+                          [&_p]:mb-4 [&_p]:leading-relaxed
+                          [&_table]:min-w-full [&_table]:border-collapse [&_table]:text-sm
+                          [&_th]:border-b [&_th]:border-border [&_th]:px-4 [&_th]:py-3 [&_th]:text-left [&_th]:font-semibold [&_th]:bg-muted/50
+                          [&_td]:px-4 [&_td]:py-3 [&_td]:border-b [&_td]:border-border
+                          [&_code]:bg-muted [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-sm [&_code]:font-mono
+                          [&_pre]:my-4 [&_pre]:bg-muted [&_pre]:rounded-lg [&_pre]:overflow-x-auto [&_pre]:p-4
+                          [&_pre_code]:bg-transparent [&_pre_code]:p-0
+                          [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:mb-4 [&_ul]:space-y-1
+                          [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:mb-4 [&_ol]:space-y-1
+                          [&_a]:text-primary [&_a]:hover:underline
+                          [&_blockquote]:border-l-4 [&_blockquote]:border-primary [&_blockquote]:pl-4 [&_blockquote]:my-4 [&_blockquote]:text-muted-foreground"
+                        dangerouslySetInnerHTML={{ __html: skillContent }}
+                      />
+                    )
+                  }
                   const { metadata, markdownContent } = parseFrontmatter(skillContent)
                   return (
                     <div className="space-y-5">
-                      {/* Metadata Table */}
                       {metadata && (
                         <div className="rounded-lg border border-border overflow-hidden">
                           <div className="bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-950/30 dark:to-indigo-950/30 px-4 py-2 border-b border-border">
@@ -928,8 +950,6 @@ export const SkillsMarketplace = React.memo(function SkillsMarketplace({
                           </table>
                         </div>
                       )}
-                      
-                      {/* Markdown Content */}
                       <div className="prose prose-sm dark:prose-invert max-w-none">
                         <ReactMarkdown
                           remarkPlugins={[remarkGfm]}

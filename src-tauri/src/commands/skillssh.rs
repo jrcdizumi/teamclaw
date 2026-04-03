@@ -635,18 +635,90 @@ fn get_fallback_leaderboard() -> Vec<SkillsShEntry> {
     ]
 }
 
-/// Fetch skill content (SKILL.md) from any git repository
-/// Supports GitHub, GitLab, Gitee, Bitbucket, and generic git URLs
-/// Uses platform-specific APIs and follows vercel-labs/skills discovery pattern
+/// Fetch skill content from the skills.sh detail page, falling back to GitHub.
+///
+/// The skills.sh page embeds the rendered SKILL.md as HTML inside Next.js RSC
+/// payload chunks (`self.__next_f.push([1, "<h1>..."])`).  We extract that HTML
+/// so the frontend can render it directly without hitting GitHub at all.
 #[tauri::command]
 pub async fn fetch_skillssh_content(
     owner: String,
     repo: String,
     slug: String,
 ) -> Result<String, String> {
-    // For backward compatibility, assume GitHub if only owner/repo provided
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .user_agent("TeamClaw/1.0")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    // Strategy 1: skills.sh detail page (fast, no GitHub rate-limit issues)
+    if let Ok(html) = fetch_skillssh_detail_page(&client, &owner, &repo, &slug).await {
+        return Ok(html);
+    }
+
+    // Strategy 2: fall back to GitHub raw content
     let github_url = format!("https://github.com/{}/{}", owner, repo);
     fetch_skill_content_from_url(&github_url, &slug).await
+}
+
+/// Fetch the skills.sh detail page and extract rendered SKILL.md HTML from the
+/// Next.js RSC stream.
+async fn fetch_skillssh_detail_page(
+    client: &reqwest::Client,
+    owner: &str,
+    repo: &str,
+    slug: &str,
+) -> Result<String, String> {
+    let url = format!("{}/{}/{}/{}", SKILLSSH_URL, owner, repo, slug);
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("skills.sh request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("skills.sh returned {}", response.status()));
+    }
+
+    let html = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    extract_skillmd_from_rsc_payload(&html)
+        .ok_or_else(|| "Could not extract SKILL.md content from skills.sh page".to_string())
+}
+
+/// Walk the RSC payload chunks embedded in the HTML and return the one that
+/// looks like rendered SKILL.md content (contains heading + paragraph tags and
+/// is reasonably large).
+fn extract_skillmd_from_rsc_payload(html: &str) -> Option<String> {
+    let marker = "self.__next_f.push(";
+
+    for part in html.split(marker).skip(1) {
+        // Each chunk ends with ")</script>"
+        let end = part.find(")</script>")?;
+        let json_str = &part[..end];
+
+        // Parse the JSON array [1, "content_string"]
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
+            if arr.len() >= 2 {
+                if let Some(content) = arr[1].as_str() {
+                    // The SKILL.md chunk is the one with heading tags and substantial length
+                    if content.len() > 300
+                        && (content.contains("<h1>") || content.contains("<h2>"))
+                        && content.contains("<p>")
+                    {
+                        return Some(content.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Fetch skill content from any git URL
