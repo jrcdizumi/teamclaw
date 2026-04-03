@@ -5,7 +5,6 @@ import remarkGfm from "remark-gfm"
 import {
   Search,
   Download,
-  ExternalLink,
   TrendingUp,
   Clock,
   Award,
@@ -23,7 +22,7 @@ import {
 } from "lucide-react"
 import { invoke } from "@tauri-apps/api/core"
 import { useWorkspaceStore } from "@/stores/workspace"
-import { cn, openExternalUrl } from "@/lib/utils"
+import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { SettingCard } from "./shared"
@@ -353,14 +352,6 @@ export const SkillsMarketplace = React.memo(function SkillsMarketplace({
       setIsLoadingContent(false)
     }
   }, [])
-
-  const handleOpenSkillsSh = async () => {
-    try {
-      await openExternalUrl("https://skills.sh")
-    } catch (err) {
-      console.error("[SkillsMarketplace] Failed to open skills.sh:", err)
-    }
-  }
 
   return (
     <div className="space-y-4">
