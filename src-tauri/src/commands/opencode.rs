@@ -349,6 +349,20 @@ pub async fn start_opencode_inner(
     // resolve_config_secret_refs runs AFTER all three complete (depends on
     // both the config writers finishing and keyring secrets being available).
 
+    // Ensure system env vars exist (e.g. tc_api_key) before reading keyring secrets.
+    // Runs synchronously — one keychain read + optional write.
+    {
+        let device_id = super::oss_commands::get_or_create_fallback_device_id()
+            .unwrap_or_default();
+        let ws = workspace_path.clone();
+        let did = device_id.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            super::env_vars::ensure_system_env_vars(&ws, &did)
+        }).await.map_err(|e| e.to_string()).and_then(|r| r) {
+            eprintln!("[OpenCode] Warning: failed to ensure system env vars: {}", e);
+        }
+    }
+
     let ws_for_config = workspace_path.clone();
     let ws_for_skills = workspace_path.clone();
     let ws_for_keyring = workspace_path.clone();
@@ -400,11 +414,15 @@ pub async fn start_opencode_inner(
 
     // Keyring retry logic (unchanged from original)
     if !failed_keys.is_empty() {
-        println!(
-            "[OpenCode] {} secret(s) failed to read ({:?}), retrying after keychain unlock...",
-            failed_keys.len(),
-            failed_keys
-        );
+        if failed_keys == ["__blob__"] {
+            println!("[OpenCode] Keychain blob unavailable, retrying after keychain unlock...");
+        } else {
+            println!(
+                "[OpenCode] {} secret(s) failed to read ({:?}), retrying after keychain unlock...",
+                failed_keys.len(),
+                failed_keys
+            );
+        }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         let ws_retry = workspace_path.clone();
@@ -417,11 +435,15 @@ pub async fn start_opencode_inner(
                 });
 
         if !still_failed.is_empty() {
-            eprintln!(
-                "[OpenCode] Warning: {} secret(s) still unavailable after retry: {:?}",
-                still_failed.len(),
-                still_failed
-            );
+            if still_failed == ["__blob__"] {
+                eprintln!("[OpenCode] Warning: keychain blob still unavailable after retry");
+            } else {
+                eprintln!(
+                    "[OpenCode] Warning: {} secret(s) still unavailable after retry: {:?}",
+                    still_failed.len(),
+                    still_failed
+                );
+            }
         }
 
         secrets = retry_secrets;
@@ -503,9 +525,15 @@ pub async fn start_opencode_inner(
 
     // Build sidecar command, also injecting secrets as process env vars (backup)
     //
-    // XDG isolation: redirect all OpenCode data/config/state/cache directories
-    // into <workspace>/.opencode/ so each workspace is fully self-contained
-    // and independent of any system-installed OpenCode.
+    // Selective XDG isolation: only redirect DATA and STATE directories into
+    // <workspace>/.opencode/ to isolate OpenCode's database and session state.
+    // CONFIG and CACHE are left at system defaults so that child processes
+    // spawned by OpenCode's bash tool (gh, git, ssh, etc.) can still find
+    // their credentials and configuration.
+    //
+    // OPENCODE_CONFIG_DIR is set so that "global" skills installed under the
+    // workspace-local config path are still discoverable by OpenCode without
+    // overriding XDG_CONFIG_HOME (which would break gh, git, etc.).
     let xdg_base = std::path::PathBuf::from(&workspace_path).join(".opencode");
     let mut sidecar_command = app
         .shell()
@@ -514,9 +542,8 @@ pub async fn start_opencode_inner(
         .args(["serve", "--port", &port_str])
         .current_dir(&workspace_path)
         .env("XDG_DATA_HOME", xdg_base.join("data").to_string_lossy().as_ref())
-        .env("XDG_CONFIG_HOME", xdg_base.join("config").to_string_lossy().as_ref())
         .env("XDG_STATE_HOME", xdg_base.join("state").to_string_lossy().as_ref())
-        .env("XDG_CACHE_HOME", xdg_base.join("cache").to_string_lossy().as_ref());
+        .env("OPENCODE_CONFIG_DIR", xdg_base.join("config").join("opencode").to_string_lossy().as_ref());
     // Inject device identity as environment variables
     if let Ok(device_id) = super::oss_commands::get_or_create_fallback_device_id() {
         sidecar_command = sidecar_command.env("device_id", &device_id);
@@ -1062,56 +1089,24 @@ fn resolve_sidecar_binary_paths(workspace_path: &str) -> Result<(), String> {
 //   2. Write resolved values into opencode.json before OpenCode starts
 //   3. Restore the ${KEY} references after all MCP servers have connected
 
-/// Read all registered env-var secrets from the OS credential store.
-///
-/// Reads the key index from `.teamclaw/teamclaw.json`, looks up each value via
-/// the `keyring` crate (cross-platform), and returns a tuple of
-/// `(successful_secrets, failed_key_names)`.
-///
-/// On macOS the first access after login may trigger a system keychain
-/// password dialog.  The caller should use `spawn_blocking` so the dialog
-/// can block a dedicated thread without starving the async runtime.
+/// Read all personal env vars from the single keychain blob.
+/// Returns `(secrets, failed)` — failed is always empty on success, or contains
+/// a diagnostic sentinel if the blob itself cannot be read.
 fn read_keyring_secrets(workspace_path: &str) -> (Vec<(String, String)>, Vec<String>) {
-    let path = format!("{}/{}/teamclaw.json", workspace_path, super::TEAMCLAW_DIR);
-    let json: serde_json::Value = match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-    {
-        Some(v) => v,
-        None => return (Vec::new(), Vec::new()),
-    };
-
-    let entries = match json.get("envVars").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return (Vec::new(), Vec::new()),
-    };
-
-    let mut secrets = Vec::new();
-    let mut failed_keys = Vec::new();
-
-    for entry in entries {
-        let key = match entry.get("key").and_then(|k| k.as_str()) {
-            Some(k) => k,
-            None => continue,
-        };
-        let service = super::env_vars::keyring_service(key);
-        match keyring::Entry::new(&service, "teamclaw").and_then(|e| e.get_password()) {
-            Ok(value) => {
-                println!(
-                    "[OpenCode] Loaded secret from keyring: {} ({}...)",
-                    key,
-                    &value[..value.len().min(8)]
-                );
-                secrets.push((key.to_string(), value));
-            }
-            Err(e) => {
-                eprintln!("[OpenCode] Failed to read keyring secret '{}': {}", key, e);
-                failed_keys.push(key.to_string());
-            }
+    match super::env_vars::read_env_blob(workspace_path) {
+        Ok(blob) => {
+            let secrets: Vec<(String, String)> = blob
+                .into_iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                .collect();
+            println!("[OpenCode] Loaded {} secrets from keychain blob", secrets.len());
+            (secrets, Vec::new())
+        }
+        Err(e) => {
+            eprintln!("[OpenCode] Failed to read keychain blob: {}", e);
+            (Vec::new(), vec!["__blob__".to_string()])
         }
     }
-
-    (secrets, failed_keys)
 }
 
 /// Replace `${KEY}` references in opencode.json MCP environment sections
